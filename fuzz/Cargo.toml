@@ -76,3 +76,10 @@ path = "fuzz_targets/ironwood_session.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "encrypted_session"
+path = "fuzz_targets/encrypted_session.rs"
+test = false
+doc = false
+bench = false

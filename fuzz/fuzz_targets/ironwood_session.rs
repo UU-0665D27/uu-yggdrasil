@@ -3,7 +3,6 @@
 use libfuzzer_sys::fuzz_target;
 
 use std::io::Cursor;
-
 use uu_yggdrasil::ironwood::{
     PacketConnBase,
     errors::Error,
