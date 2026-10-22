@@ -103,6 +103,19 @@ impl WireEncodable for Traffic {
         Ok(())
     }
 }
+impl crate::ironwood::network::packet_queue::PqPacket for Traffic {
+    fn wire_type(&self) -> crate::ironwood::network::wire::WirePacketType {
+        crate::ironwood::network::wire::WirePacketType::Traffic
+    }
+
+    fn source_key(&self) -> crate::ironwood::network::crypto::PublicKey {
+        self.source
+    }
+
+    fn dest_key(&self) -> crate::ironwood::network::crypto::PublicKey {
+        self.dest
+    }
+}
 
 impl Traffic {
     #[must_use]
