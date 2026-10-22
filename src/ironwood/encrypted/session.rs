@@ -580,7 +580,6 @@ impl SessionManager {
             return out;
         }
         match data[0] {
-            SESSION_TYPE_DUMMY => {}
             SESSION_TYPE_INIT => {
                 let mut init = SessionInit::new([0u8; 32], [0u8; 32], 0);
                 if init.decrypt(&self.secret_box, &from, data, &self.group_auth) {
@@ -597,6 +596,7 @@ impl SessionManager {
             SESSION_TYPE_TRAFFIC => {
                 self.handle_traffic(from, data, now, &mut out);
             }
+            // `SESSION_TYPE_DUMMY` и всё неизвестное — молча игнорируем.
             _ => {}
         }
         out
@@ -955,7 +955,7 @@ mod tests {
             .iter()
             .find_map(|e| match e {
                 SessionEvent::Deliver { from, payload } => Some((*from, payload.clone())),
-                _ => None,
+                SessionEvent::Send { .. } => None,
             })
             .expect("bob should deliver payload");
         assert_eq!(delivered.0, alice_pub);
