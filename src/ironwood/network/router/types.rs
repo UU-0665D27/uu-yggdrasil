@@ -220,7 +220,7 @@ pub struct RouterInfo {
 
 impl RouterInfo {
     #[must_use]
-    pub fn get_announce(&self, key: PublicKey) -> RouterAnnounce {
+    pub const fn get_announce(&self, key: PublicKey) -> RouterAnnounce {
         RouterAnnounce {
             key,
             parent: self.parent,

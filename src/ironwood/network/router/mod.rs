@@ -168,17 +168,17 @@ impl Router {
     ) -> Option<(PublicKey, HashMap<PublicKey, u64>)> {
         let mut dists = HashMap::new();
         let mut next = dest;
-        let mut dist = 0u64;
+        let mut depth = 0u64;
         loop {
             if dists.contains_key(&next) {
                 return None; // loop
             }
             let info = self.infos.get(&next)?;
-            dists.insert(next, dist);
+            dists.insert(next, depth);
             if info.parent == next {
                 return Some((next, dists));
             }
-            dist += 1;
+            depth += 1;
             next = info.parent;
         }
     }
@@ -299,11 +299,11 @@ impl Router {
         let mut candidates: Vec<(PublicKey, PeerMeta, u64)> = Vec::new();
         for k in &peer_keys {
             let dist = self.get_dist(path, *k);
-            if dist < bound {
-                if let Some(metas) = self.peers.get(k) {
-                    for &meta in metas {
-                        candidates.push((*k, meta, dist));
-                    }
+            if dist < bound
+                && let Some(metas) = self.peers.get(k)
+            {
+                for &meta in metas {
+                    candidates.push((*k, meta, dist));
                 }
             }
         }
