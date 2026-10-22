@@ -1,3 +1,4 @@
+pub mod encrypted;
 pub mod errors;
 pub mod network;
 pub mod signed;
