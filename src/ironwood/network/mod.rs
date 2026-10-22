@@ -17,6 +17,6 @@ pub use packet_queue::{PacketQueue, PqPacket};
 pub use pathfinder::{PathBroken, PathLookup, PathNotify, PathNotifyInfo};
 pub use peer::{InFrame, OutFrame, PacketDispatcher, Peer, PeerHandle, encode_frame, session_loop};
 pub use router::types::{RouterAnnounce, RouterInfo, RouterSigReq, RouterSigRes};
-pub use router::{PeerMeta, Router, RouterPath};
+pub use router::{ROUTER_UNKNOWN_LATENCY, Router, RouterPath, TrafficAction};
 pub use traffic::Traffic;
 pub use wire::{PeerPort, WireEncodable, WirePacketType};

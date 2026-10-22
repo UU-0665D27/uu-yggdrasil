@@ -1,17 +1,27 @@
 pub mod types;
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ed25519_dalek::{Signature, Signer};
 
-use crate::ironwood::network::{
-    config::Config,
-    crypto::{Crypto, PublicKey, public_key_less},
-    wire::PeerPort,
+use crate::ironwood::{
+    errors::Error,
+    network::{
+        config::Config,
+        crypto::{Crypto, PublicKey, public_key_less},
+        peer::PeerHandle,
+        traffic::Traffic,
+        wire::PeerPort,
+    },
 };
 
 pub use types::{RouterAnnounce, RouterInfo, RouterSigReq, RouterSigRes};
+
+/// `time.Duration(^uint32(0))` из Go — задержка ещё не замерена.
+pub const ROUTER_UNKNOWN_LATENCY: Duration = Duration::from_millis(u32::MAX as u64);
 
 /// `routerPath { root, path }`.
 #[derive(Debug, Clone)]
@@ -20,22 +30,68 @@ pub struct RouterPath {
     pub path: Vec<PeerPort>,
 }
 
-/// Per-peer metadata. Заполняется `Peer` при подключении.
-#[derive(Debug, Clone, Copy)]
-pub struct PeerMeta {
-    pub prio: u8,
-    pub order: u64,
-    pub cost: u64,
+struct PeerEntry {
+    handle: Arc<dyn PeerHandle>,
 }
 
-/// `struct router` — состояние и чистые алгоритмы.
+/// Результат `Router::handle_traffic` — кто исполняет действие.
+pub enum TrafficAction {
+    /// Переслать next-hop'у.
+    Forward(Arc<dyn PeerHandle>, Traffic),
+    /// Трафик адресован нам — доставить в `recv_q`.
+    DeliverLocal(Traffic),
+    /// Маршрут потерян — pathfinder сгенерирует `pathBroken`.
+    Broken(Traffic),
+}
+
+impl std::fmt::Debug for TrafficAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forward(p, tr) => f
+                .debug_struct("Forward")
+                .field("next_hop", &p.key())
+                .field("traffic", tr)
+                .finish(),
+            Self::DeliverLocal(tr) => f.debug_tuple("DeliverLocal").field(tr).finish(),
+            Self::Broken(tr) => f.debug_tuple("Broken").field(tr).finish(),
+        }
+    }
+}
+
+struct Candidate {
+    key: PublicKey,
+    handle: Arc<dyn PeerHandle>,
+    dist: u64,
+    cost: u64,
+    prio: u8,
+    order: u64,
+}
+
+/// Identity пира по адресу данных (без vtable). `Arc<dyn PeerHandle>`
+/// держит объект по стабильному адресу; адрес уникален на время жизни `Arc`.
+fn peer_identity(p: &dyn PeerHandle) -> usize {
+    std::ptr::from_ref(p).cast::<()>() as usize
+}
+
+fn arc_identity(p: &Arc<dyn PeerHandle>) -> usize {
+    Arc::as_ptr(p).cast::<()>() as usize
+}
+
+/// `struct router`.
 pub struct Router {
     crypto: Arc<Crypto>,
     config: Config,
 
     pub infos: HashMap<PublicKey, RouterInfo>,
     cache: HashMap<PublicKey, RouterPath>,
-    peers: HashMap<PublicKey, Vec<PeerMeta>>,
+
+    peers: HashMap<PublicKey, Vec<PeerEntry>>,
+    lags: HashMap<usize, Duration>,
+    requests: HashMap<PublicKey, RouterSigReq>,
+    responses: HashMap<PublicKey, RouterSigRes>,
+    responded: HashSet<usize>,
+    sent: HashMap<PublicKey, HashSet<PublicKey>>,
+
     refresh: bool,
 }
 
@@ -48,6 +104,11 @@ impl Router {
             infos: HashMap::new(),
             cache: HashMap::new(),
             peers: HashMap::new(),
+            lags: HashMap::new(),
+            requests: HashMap::new(),
+            responses: HashMap::new(),
+            responded: HashSet::new(),
+            sent: HashMap::new(),
             refresh: false,
         }
     }
@@ -62,16 +123,12 @@ impl Router {
         &self.crypto
     }
 
-    /// `func (r *router) _resetCache()`.
     pub fn reset_cache(&mut self) {
         self.cache.clear();
     }
 
-    /// `func (r *router) _newReq()`.
-    ///
-    /// Ошибка `getrandom` намеренно игнорируется — как `crand.Read(nonce)`
-    /// в Go. `nonce` здесь — только tie-breaker в `update()`, не крипто-назначение.
-    /// При сбое OS RNG nonce = 0, что просто понижает приоритет анонса.
+    // ────────────── Announce / SigReq / SigRes ──────────────
+
     #[must_use]
     pub fn new_req(&self) -> RouterSigReq {
         let mut nonce = [0u8; 8];
@@ -87,13 +144,10 @@ impl Router {
         }
     }
 
-    /// `func (r *router) _becomeRoot()` — самоподписанный announce с port=0.
     pub fn become_root(&mut self) -> bool {
         let req = self.new_req();
         let self_key = *self.crypto.public_key();
 
-        // Считаем подпись над `bytes_for_sig` — `psig` в структуре не участвует,
-        // так что placeholder допустим.
         let unsigned = RouterSigRes {
             req,
             port: 0,
@@ -114,26 +168,21 @@ impl Router {
         self.update(&ann)
     }
 
-    /// `func (r *router) _update(ann)` — принять/отклонить announce.
-    ///
-    /// Порядок проверок **обязан** совпадать на всех узлах; иначе пиры
-    /// могут бесконечно спамить друг друга announce'ами.
+    /// Принять/отклонить announce. Порядок проверок **обязан** совпадать
+    /// на всех узлах. Сбрасывает `cache` и `sent[*][ann.key]` при успехе.
     pub fn update(&mut self, ann: &RouterAnnounce) -> bool {
         if let Some(info) = self.infos.get(&ann.key) {
             match ann.res.req.seq.cmp(&info.res.req.seq) {
-                std::cmp::Ordering::Less => return false,
-                std::cmp::Ordering::Greater => {}
-                std::cmp::Ordering::Equal => {
+                Ordering::Less => return false,
+                Ordering::Greater => {}
+                Ordering::Equal => {
                     if public_key_less(&info.parent, &ann.parent) {
-                        // info.parent < ann.parent — у нас (info) лучше (ниже),
-                        // значит ann хуже → отклонить.
                         return false;
-                    } else if public_key_less(&ann.parent, &info.parent) {
-                        // ann.parent < info.parent — ann лучше, принять.
-                    } else if ann.res.req.nonce < info.res.req.nonce {
-                        // Тот же seq и parent, ann.nonce меньше — принять.
-                    } else {
-                        // Тот же seq и parent, nonce не лучше — отклонить.
+                    }
+                    let parent_better = public_key_less(&ann.parent, &info.parent);
+                    let same_parent_and_nonce_better =
+                        ann.parent == info.parent && ann.res.req.nonce < info.res.req.nonce;
+                    if !(parent_better || same_parent_and_nonce_better) {
                         return false;
                     }
                 }
@@ -141,6 +190,9 @@ impl Router {
         }
 
         self.cache.clear();
+        for sent in self.sent.values_mut() {
+            sent.remove(&ann.key);
+        }
 
         let info = RouterInfo {
             parent: ann.parent,
@@ -151,16 +203,201 @@ impl Router {
         self.infos.insert(ann.key, info);
 
         if is_self {
-            // TODO: refresh-таймер через config.router_refresh.
             self.refresh = true;
-        } else {
-            // TODO: timeout-таймер через config.router_timeout;
-            // по истечении убрать ann.key из infos и очистить кэш.
         }
         true
     }
 
-    /// `func (r *router) _getRootAndDists(dest)`.
+    /// `ProtoSigReq`: строим подписанный `res` и шлём назад.
+    pub fn handle_request(&mut self, peer: &dyn PeerHandle, req: &RouterSigReq) {
+        let self_key = *self.crypto.public_key();
+        let peer_key = peer.key();
+
+        let placeholder = RouterSigRes {
+            req: *req,
+            port: peer.port(),
+            psig: Signature::from_bytes(&[0u8; 64]),
+        };
+        let psig = self
+            .crypto
+            .private_key()
+            .sign(&placeholder.bytes_for_sig(&peer_key, &self_key));
+
+        let res = RouterSigRes {
+            req: *req,
+            port: peer.port(),
+            psig,
+        };
+        peer.send_sig_res(&res);
+    }
+
+    /// `ProtoSigRes`: проверка подписи + обновление `responses`/`responded`/`lags`.
+    ///
+    /// # Errors
+    /// [`Error::BAD_MESSAGE`] если подпись не сходится.
+    pub fn handle_response(
+        &mut self,
+        peer: &dyn PeerHandle,
+        res: &RouterSigRes,
+        rtt: Duration,
+    ) -> Result<(), Error> {
+        let self_key = *self.crypto.public_key();
+        let peer_key = peer.key();
+        if !res.check(&self_key, &peer_key) {
+            return Err(Error::BAD_MESSAGE);
+        }
+
+        let key = peer_key;
+        let peer_id = peer_identity(peer);
+
+        if !self.responses.contains_key(&key)
+            && let Some(our_req) = self.requests.get(&key)
+            && *our_req == res.req
+        {
+            self.responses.insert(key, *res);
+        }
+
+        if let Some(our_req) = self.requests.get(&key)
+            && *our_req == res.req
+            && self.responded.insert(peer_id)
+        {
+            let lag = self
+                .lags
+                .get(&peer_id)
+                .copied()
+                .unwrap_or(ROUTER_UNKNOWN_LATENCY);
+            let next = if lag == ROUTER_UNKNOWN_LATENCY {
+                rtt * 2
+            } else {
+                let prev = lag;
+                lag * 7 / 8 + rtt.min(prev * 2) / 8
+            };
+            self.lags.insert(peer_id, next);
+        }
+        Ok(())
+    }
+
+    /// `ProtoAnnounce`: проверка подписи + `update` + `sent`-трекинг.
+    /// В случае, если наш info лучше присланного, шлём его обратно.
+    ///
+    /// # Errors
+    /// [`Error::BAD_MESSAGE`] если подпись не сходится.
+    pub fn handle_announce(
+        &mut self,
+        peer: &dyn PeerHandle,
+        ann: &RouterAnnounce,
+    ) -> Result<(), Error> {
+        if !ann.check() {
+            return Err(Error::BAD_MESSAGE);
+        }
+        if self.update(ann) {
+            if ann.key == *self.crypto.public_key() {
+                self.refresh = true;
+            }
+            self.sent.entry(peer.key()).or_default().insert(ann.key);
+        } else {
+            let new_info = RouterInfo {
+                parent: ann.parent,
+                res: ann.res,
+                sig: ann.sig,
+            };
+            if let Some(old) = self.infos.get(&ann.key) {
+                self.sent.entry(peer.key()).or_default().insert(ann.key);
+                if new_info != *old {
+                    peer.send_announce(&old.get_announce(ann.key));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ────────────── Traffic ──────────────
+
+    /// `ProtoTraffic`: маршрутизация + `watermark`-обновление.
+    pub fn handle_traffic(&mut self, mut tr: Traffic) -> TrafficAction {
+        let self_key = *self.crypto.public_key();
+        let mut wm = tr.watermark;
+        let next = self.lookup(&tr.path, Some(&mut wm));
+        tr.watermark = wm;
+
+        if let Some(p) = next {
+            return TrafficAction::Forward(p, tr);
+        }
+        if tr.dest == self_key {
+            return TrafficAction::DeliverLocal(tr);
+        }
+        TrafficAction::Broken(tr)
+    }
+
+    /// `sendTraffic(tr)` — упрощённая версия (без pathfinder-кэша).
+    pub fn send_traffic(&mut self, tr: Traffic) -> TrafficAction {
+        self.handle_traffic(tr)
+    }
+
+    // ────────────── Peer management ──────────────
+
+    /// `add_peer`: регистрирует сессию. `true` — ключ новый.
+    pub fn add_peer(&mut self, peer: &Arc<dyn PeerHandle>) -> bool {
+        let key = peer.key();
+        let peer_id = arc_identity(peer);
+        let is_new = !self.peers.contains_key(&key);
+
+        self.peers.entry(key).or_default().push(PeerEntry {
+            handle: Arc::clone(peer),
+        });
+        self.lags.insert(peer_id, ROUTER_UNKNOWN_LATENCY);
+
+        if is_new {
+            self.sent.insert(key, HashSet::new());
+        } else {
+            let resent: Vec<PublicKey> = self
+                .sent
+                .get(&key)
+                .map_or_default(|s| s.iter().copied().collect());
+            for k in resent {
+                if let Some(info) = self.infos.get(&k) {
+                    peer.send_announce(&info.get_announce(k));
+                }
+            }
+        }
+
+        if !self.requests.contains_key(&key) {
+            let req = self.new_req();
+            self.requests.insert(key, req);
+        }
+        let req = self.requests[&key];
+        self.responded.remove(&peer_id);
+        peer.send_sig_req(&req);
+
+        is_new
+    }
+
+    /// `remove_peer`: снимает сессию с учёта.
+    pub fn remove_peer(&mut self, peer: &Arc<dyn PeerHandle>) {
+        let key = peer.key();
+        let peer_id = arc_identity(peer);
+
+        if let Some(list) = self.peers.get_mut(&key) {
+            list.retain(|e| arc_identity(&e.handle) != peer_id);
+            if list.is_empty() {
+                self.peers.remove(&key);
+                self.sent.remove(&key);
+                self.requests.remove(&key);
+                self.responses.remove(&key);
+            }
+        }
+        self.lags.remove(&peer_id);
+        self.responded.remove(&peer_id);
+    }
+
+    pub fn iter_peers(&self) -> impl Iterator<Item = &Arc<dyn PeerHandle>> {
+        self.peers
+            .values()
+            .flat_map(|v| v.iter().map(|e| &e.handle))
+    }
+
+    // ────────────── Tree ──────────────
+
     #[must_use]
     pub fn get_root_and_dists(
         &self,
@@ -171,7 +408,7 @@ impl Router {
         let mut depth = 0u64;
         loop {
             if dists.contains_key(&next) {
-                return None; // loop
+                return None;
             }
             let info = self.infos.get(&next)?;
             dists.insert(next, depth);
@@ -183,25 +420,22 @@ impl Router {
         }
     }
 
-    /// `func (r *router) _getRootAndPath(dest)` с кэшем.
     #[must_use]
     pub fn get_root_and_path(&mut self, dest: PublicKey) -> (PublicKey, Vec<PeerPort>) {
         if let Some(cached) = self.cache.get(&dest) {
             return (cached.root, cached.path.clone());
         }
-
         let mut ports = Vec::new();
         let mut visited = HashSet::new();
         let mut next = dest;
         loop {
             if !visited.insert(next) {
-                return (dest, Vec::new()); // loop
+                return (dest, Vec::new());
             }
             let Some(info) = self.infos.get(&next) else {
-                return (dest, Vec::new()); // dead end
+                return (dest, Vec::new());
             };
             if next == info.parent {
-                // Достигли корня — не пушим его port, `next` и есть root.
                 break;
             }
             ports.push(info.res.port);
@@ -219,7 +453,6 @@ impl Router {
         (root, ports)
     }
 
-    /// `func (r *router) _getDist(destPath, key)`.
     #[must_use]
     pub fn get_dist(&mut self, dest_path: &[PeerPort], key: PublicKey) -> u64 {
         let (root, key_path) = self.get_root_and_path(key);
@@ -244,7 +477,6 @@ impl Router {
         (key_path.len() + dest_path.len() - 2 * common) as u64
     }
 
-    /// `func (r *router) _getAncestry(key)` — от корня к `key`.
     #[must_use]
     pub fn get_ancestry(&self, key: PublicKey) -> Vec<PublicKey> {
         let mut anc = Vec::with_capacity(32);
@@ -268,20 +500,14 @@ impl Router {
         }
     }
 
-    pub fn add_peer(&mut self, key: PublicKey, meta: PeerMeta) {
-        self.peers.entry(key).or_default().push(meta);
-    }
+    // ────────────── lookup ──────────────
 
-    pub fn remove_peer(&mut self, key: &PublicKey) {
-        self.peers.remove(key);
-    }
-
-    /// `func (r *router) _lookup(path, watermark)` — упрощённая версия.
-    ///
-    /// Возвращает ключ next-hop'а. Сортировка — по `cost * dist`, тай-брейк
-    /// по меньшему `prio`, затем по меньшему `order` (старшие соединения).
     #[must_use]
-    pub fn lookup(&mut self, path: &[PeerPort], watermark: Option<&mut u64>) -> Option<PublicKey> {
+    pub fn lookup(
+        &mut self,
+        path: &[PeerPort],
+        watermark: Option<&mut u64>,
+    ) -> Option<Arc<dyn PeerHandle>> {
         let self_key = *self.crypto.public_key();
         let self_dist = self.get_dist(path, self_key);
 
@@ -296,44 +522,58 @@ impl Router {
         }
 
         let peer_keys: Vec<PublicKey> = self.peers.keys().copied().collect();
-        let mut candidates: Vec<(PublicKey, PeerMeta, u64)> = Vec::new();
+        let mut candidates: Vec<Candidate> = Vec::new();
         for k in &peer_keys {
             let dist = self.get_dist(path, *k);
-            if dist < bound
-                && let Some(metas) = self.peers.get(k)
-            {
-                for &meta in metas {
-                    candidates.push((*k, meta, dist));
+            if dist >= bound {
+                continue;
+            }
+            if let Some(entries) = self.peers.get(k) {
+                for e in entries {
+                    let pid = arc_identity(&e.handle);
+                    let lag = self
+                        .lags
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or(ROUTER_UNKNOWN_LATENCY);
+                    let cost = u64::try_from(lag.as_millis()).unwrap_or(u64::MAX).max(1);
+                    candidates.push(Candidate {
+                        key: *k,
+                        handle: Arc::clone(&e.handle),
+                        dist,
+                        cost,
+                        prio: e.handle.prio(),
+                        order: e.handle.order(),
+                    });
                 }
             }
         }
 
-        let mut best: Option<(PublicKey, PeerMeta, u64)> = None;
+        let mut best: Option<Candidate> = None;
         let mut best_cost = u64::MAX;
         let mut best_dist = u64::MAX;
 
-        for &(key, meta, dist) in &candidates {
-            let cost = meta.cost.max(1);
+        for c in candidates {
             let replace = match &best {
                 None => true,
-                Some((bk, bm, _)) => {
-                    if key == *bk && meta.prio < bm.prio {
+                Some(b) => {
+                    if c.key == b.key && c.prio < b.prio {
                         true
-                    } else if key == *bk && meta.prio > bm.prio {
+                    } else if c.key == b.key && c.prio > b.prio {
                         false
                     } else {
-                        let lhs = cost.saturating_mul(dist);
+                        let lhs = c.cost.saturating_mul(c.dist);
                         let rhs = best_cost.saturating_mul(best_dist);
                         match lhs.cmp(&rhs) {
-                            std::cmp::Ordering::Less => true,
-                            std::cmp::Ordering::Greater => false,
-                            std::cmp::Ordering::Equal => match dist.cmp(&best_dist) {
-                                std::cmp::Ordering::Less => true,
-                                std::cmp::Ordering::Greater => false,
-                                std::cmp::Ordering::Equal => match cost.cmp(&best_cost) {
-                                    std::cmp::Ordering::Less => true,
-                                    std::cmp::Ordering::Greater => false,
-                                    std::cmp::Ordering::Equal => meta.order < bm.order,
+                            Ordering::Less => true,
+                            Ordering::Greater => false,
+                            Ordering::Equal => match c.dist.cmp(&best_dist) {
+                                Ordering::Less => true,
+                                Ordering::Greater => false,
+                                Ordering::Equal => match c.cost.cmp(&best_cost) {
+                                    Ordering::Less => true,
+                                    Ordering::Greater => false,
+                                    Ordering::Equal => c.order < b.order,
                                 },
                             },
                         }
@@ -341,12 +581,12 @@ impl Router {
                 }
             };
             if replace {
-                best = Some((key, meta, dist));
-                best_cost = cost;
-                best_dist = dist;
+                best_cost = c.cost;
+                best_dist = c.dist;
+                best = Some(c);
             }
         }
 
-        best.map(|(k, _, _)| k)
+        best.map(|c| c.handle)
     }
 }
