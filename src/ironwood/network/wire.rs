@@ -58,14 +58,18 @@ pub const fn wire_size_uint(mut u: u64) -> usize {
 }
 
 /// Аналог `wireAppendUint` (`binary.AppendUvarint`).
+///
+/// `u.to_le_bytes()[0]` — младший байт `u`, что и требовалось: Uvarint
+/// кодирует младшие 7 бит на байт, старший бит байта — continuation.
 pub fn wire_append_uint(out: &mut Vec<u8>, mut u: u64) {
     while u >= 0x80 {
-        out.push((u as u8) | 0x80);
+        // low-байт + continuation-флаг; старшие 7 бит уйдут в следующие итерации.
+        out.push(u.to_le_bytes()[0] | 0x80);
         u >>= 7;
     }
-    out.push(u as u8);
+    // На выходе из цикла u < 0x80, поэтому старший бит low-байта = 0.
+    out.push(u.to_le_bytes()[0]);
 }
-
 /// Аналог `wireChopUint` (`binary.Uvarint`). Читает и сдвигает `data`.
 /// Возвращает `None` на битом или неполном varint.
 pub fn wire_chop_uint(data: &mut &[u8]) -> Option<u64> {
@@ -146,7 +150,7 @@ pub fn wire_decode_path(data: &[u8]) -> Option<(Vec<PeerPort>, usize)> {
 
 /// Аналог `wireChopPath`.
 pub fn wire_chop_path(out: &mut Vec<PeerPort>, data: &mut &[u8]) -> bool {
-    match wire_decode_path(*data) {
+    match wire_decode_path(data) {
         Some((path, len)) => {
             out.extend_from_slice(&path);
             *data = &data[len..];
@@ -161,6 +165,10 @@ pub fn wire_chop_path(out: &mut Vec<PeerPort>, data: &mut &[u8]) -> bool {
 /// `wireEncodeable`.
 pub trait WireEncodable {
     fn size(&self) -> usize;
+    /// Записывает тело пакета в `out` (без байта типа).
+    ///
+    /// # Errors
+    /// Ошибка кодирования конкретной реализации — обычно [`Error::ENCODE`].
     fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error>;
 }
 

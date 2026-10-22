@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -28,8 +28,11 @@ impl Deadline {
     }
 
     /// `func (d *deadline) set(t time.Time)`. `None` = без дедлайна.
+    ///
+    /// Poison от предыдущей паники восстанавливается: состояние `Inner`
+    /// (токен и `JoinHandle`) остаётся валидным, отменять нечего.
     pub fn set(&self, t: Option<Instant>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
         if let Some(task) = inner.task.take() {
             task.abort();
@@ -51,7 +54,7 @@ impl Deadline {
     /// Ждать отмены текущего дедлайна. Аналог `<-d.getCancel()`.
     pub async fn cancelled(&self) {
         let token = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             inner.cancel.clone()
         };
         token.cancelled().await;

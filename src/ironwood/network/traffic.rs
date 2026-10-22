@@ -22,19 +22,17 @@ pub struct Traffic {
 }
 
 impl Traffic {
-    /// Размер заголовка для пустого `Traffic` — соответствует Go-шному
-    /// `overhead := tr.size() + 1` в `PacketConn.MTU()`.
+    /// Размер заголовка для пустого `Traffic` (payload = 0, watermark = `u64::MAX`),
+    /// плюс байт типа сообщения — аналог `overhead := uint64(tr.size()) + 1`
+    /// в Go-шном `PacketConn.MTU()`.
     #[must_use]
-    pub fn header_size() -> u64 {
-        let empty = Self {
-            path: Vec::new(),
-            from: Vec::new(),
-            source: PublicKey::from_bytes(&[0u8; 32]).unwrap(),
-            dest: PublicKey::from_bytes(&[0u8; 32]).unwrap(),
-            watermark: u64::MAX,
-            payload: Vec::new(),
-        };
-        empty.size() + 1 // +1 — байт типа сообщения
+    pub const fn header_size() -> u64 {
+        // path terminator (1) + from terminator (1)
+        // + source (32) + dest (32)
+        // + watermark varint для u64::MAX (10)
+        // + type byte (1)
+        // = 77
+        1 + 1 + 32 + 32 + 10 + 1
     }
 
     #[must_use]
