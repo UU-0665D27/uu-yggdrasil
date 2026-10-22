@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::ironwood::network::pathfinder::Pathfinder;
 use crate::ironwood::{
     errors::Error,
     network::{
@@ -34,6 +35,7 @@ pub struct Ironwood {
     config: Config,
     crypto: Arc<Crypto>,
     router: Mutex<Router>,
+    pathfinder: Mutex<Pathfinder>,
     peers: Mutex<Peers>,
     recv_q: Mutex<VecDeque<Traffic>>,
     recv_notify: Notify,
@@ -52,10 +54,12 @@ impl Ironwood {
         let mut router = Router::new(Arc::clone(&crypto), config.clone());
         // Сразу self-root'имся: без этого `lookup` не найдёт маршрута ни к кому.
         router.become_root();
+        let pathfinder = Pathfinder::new(&crypto);
         Ok(Arc::new(Self {
             config,
             crypto,
             router: Mutex::new(router),
+            pathfinder: Mutex::new(pathfinder),
             peers: Mutex::new(Peers::new()),
             recv_q: Mutex::new(VecDeque::new()),
             recv_notify: Notify::new(),
@@ -63,12 +67,6 @@ impl Ironwood {
             shutdown: CancellationToken::new(),
             closed: AtomicBool::new(false),
         }))
-    }
-
-    /// Периодическое обслуживание. Вызывать из фоновой таски (или вручную
-    /// из тестов/фаззера).
-    pub fn do_maintenance(&self) {
-        self.router_lock().do_maintenance();
     }
 
     fn router_lock(&self) -> MutexGuard<'_, Router> {
@@ -81,6 +79,19 @@ impl Ironwood {
         self.recv_q.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn pathfinder_lock(&self) -> MutexGuard<'_, Pathfinder> {
+        self.pathfinder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Периодическое обслуживание. В Go это `_doMaintenance`; у нас пока
+    /// только Bloom'ы — `_fix`/`_sendAnnounces` придут со следующим этапом.
+    pub fn do_maintenance(&self) {
+        let mut router = self.router_lock();
+        router.do_maintenance();
+        drop(router);
+        self.pathfinder_lock().do_maintenance(&self.config);
+    }
     /// Доставить трафик в `recv_q`. Дропаем старые пакеты, если переполнено.
     fn deliver_local(&self, tr: Traffic) {
         if tr.dest != *self.crypto.public_key() {

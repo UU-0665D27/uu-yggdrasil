@@ -120,6 +120,25 @@ impl Router {
     pub const fn config(&self) -> &Config {
         &self.config
     }
+    #[must_use]
+    pub const fn blooms(&self) -> &Blooms {
+        &self.blooms
+    }
+
+    #[must_use]
+    pub fn best_peer_for(&self, key: &PublicKey) -> Option<Arc<dyn PeerHandle>> {
+        self.peers
+            .get(key)
+            .and_then(|v| v.iter().min_by_key(|e| e.handle.prio()))
+            .map(|e| Arc::clone(&e.handle))
+    }
+
+    /// Периодическое обслуживание. В Go это `_doMaintenance`; у нас пока
+    /// только Bloom'ы — `_fix`/`_sendAnnounces` придут со следующим этапом.
+    pub fn do_maintenance(&mut self) {
+        self.fix_blooms_on_tree();
+        self.send_all_blooms();
+    }
 
     #[must_use]
     pub const fn crypto(&self) -> &Arc<Crypto> {
@@ -727,12 +746,5 @@ impl Router {
                 }
             }
         }
-    }
-
-    /// Периодическое обслуживание. В Go это `_doMaintenance`; у нас пока
-    /// только Bloom'ы — `_fix`/`_sendAnnounces` придут со следующим этапом.
-    pub fn do_maintenance(&mut self) {
-        self.fix_blooms_on_tree();
-        self.send_all_blooms();
     }
 }
