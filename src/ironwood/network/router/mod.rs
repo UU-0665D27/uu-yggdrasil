@@ -1,15 +1,10 @@
 pub mod types;
 
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
-
-use ed25519_dalek::{Signature, Signer};
-
 use crate::ironwood::{
     errors::Error,
     network::{
+        Bloom,
+        bloomfilter::Blooms,
         config::Config,
         crypto::{Crypto, PublicKey, public_key_less},
         peer::PeerHandle,
@@ -17,7 +12,13 @@ use crate::ironwood::{
         wire::PeerPort,
     },
 };
-
+use ed25519_dalek::{Signature, Signer};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 pub use types::{RouterAnnounce, RouterInfo, RouterSigReq, RouterSigRes};
 
 /// `time.Duration(^uint32(0))` из Go — задержка ещё не замерена.
@@ -92,6 +93,7 @@ pub struct Router {
     responded: HashSet<usize>,
     sent: HashMap<PublicKey, HashSet<PublicKey>>,
 
+    blooms: Blooms,
     refresh: bool,
 }
 
@@ -109,6 +111,7 @@ impl Router {
             responses: HashMap::new(),
             responded: HashSet::new(),
             sent: HashMap::new(),
+            blooms: Blooms::new(),
             refresh: false,
         }
     }
@@ -143,7 +146,14 @@ impl Router {
             nonce: u64::from_be_bytes(nonce),
         }
     }
-
+    /// `func (bs *blooms) xKey(key)` — трансформация ключа для Bloom'а.
+    #[must_use]
+    pub fn x_key(&self, key: &PublicKey) -> [u8; 32] {
+        (self.config.bloom_transform)(key)
+    }
+    pub fn handle_bloom(&mut self, peer: &dyn PeerHandle, b: &Bloom) {
+        self.blooms.handle_bloom(&peer.key(), b.clone());
+    }
     pub fn become_root(&mut self) -> bool {
         let req = self.new_req();
         let self_key = *self.crypto.public_key();
@@ -349,6 +359,7 @@ impl Router {
 
         if is_new {
             self.sent.insert(key, HashSet::new());
+            self.blooms.add_info(key);
         } else {
             let resent: Vec<PublicKey> = self
                 .sent
@@ -384,6 +395,21 @@ impl Router {
                 self.sent.remove(&key);
                 self.requests.remove(&key);
                 self.responses.remove(&key);
+                self.blooms.remove_info(&key); // ← добавь
+            } else {
+                // Ре-отправить текущий `send` bloom остающимся пирам этого ключа.
+                let bloom_to_send = self
+                    .blooms
+                    .iter()
+                    .find(|(k, _)| **k == key)
+                    .map(|(_, i)| i.send.clone());
+                if let Some(b) = bloom_to_send {
+                    let peers: Vec<Arc<dyn PeerHandle>> =
+                        list.iter().map(|e| Arc::clone(&e.handle)).collect();
+                    for p in peers {
+                        p.send_bloom(&b);
+                    }
+                }
             }
         }
         self.lags.remove(&peer_id);
@@ -588,5 +614,125 @@ impl Router {
         }
 
         best.map(|c| c.handle)
+    }
+    fn fix_blooms_on_tree(&mut self) {
+        let self_key = *self.crypto.public_key();
+        let Some(self_info) = self.infos.get(&self_key) else {
+            return;
+        };
+        let self_parent = self_info.parent;
+        let keys: Vec<PublicKey> = self.blooms.iter().map(|(k, _)| *k).collect();
+        for pk in keys {
+            let was_on = self
+                .blooms
+                .iter()
+                .find(|(k, _)| **k == pk)
+                .is_some_and(|(_, i)| i.on_tree);
+            let is_on =
+                self_parent == pk || self.infos.get(&pk).is_some_and(|i| i.parent == self_key);
+            if let Some(info) = self.blooms.get_mut(&pk) {
+                info.on_tree = is_on;
+                if was_on && !is_on {
+                    info.send = Bloom::new();
+                }
+            }
+            if was_on && !is_on {
+                let peers: Vec<Arc<dyn PeerHandle>> = self
+                    .peers
+                    .get(&pk)
+                    .map_or_default(|v| v.iter().map(|e| Arc::clone(&e.handle)).collect());
+                let blank = Bloom::new();
+                for p in peers {
+                    p.send_bloom(&blank);
+                }
+            }
+        }
+    }
+
+    fn compute_bloom_for(&mut self, key: PublicKey, keep_ones: bool) -> (Bloom, bool) {
+        let self_key = *self.crypto.public_key();
+        let xform = (self.config.bloom_transform)(&self_key);
+
+        let mut b = Bloom::new();
+        b.add_bytes(&xform);
+
+        let others: Vec<Bloom> = self
+            .blooms
+            .iter()
+            .filter(|(k, info)| info.on_tree && **k != key)
+            .map(|(_, info)| info.recv.clone())
+            .collect();
+        for other in &others {
+            b.merge(other);
+        }
+
+        let Some(info) = self.blooms.get_mut(&key) else {
+            return (b, true);
+        };
+
+        if keep_ones {
+            if !info.z_dirty {
+                let probe = {
+                    let mut p = b.clone();
+                    p.merge(&info.send);
+                    p
+                };
+                if probe != b {
+                    info.z_dirty = true;
+                }
+            }
+            b.merge(&info.send);
+        } else {
+            info.z_dirty = false;
+        }
+
+        let is_new = b != info.send;
+        if is_new {
+            info.send = b.clone();
+        } else {
+            b = info.send.clone();
+        }
+        (b, is_new)
+    }
+
+    fn send_all_blooms(&mut self) {
+        let keys: Vec<PublicKey> = self
+            .blooms
+            .iter()
+            .filter(|(_, i)| i.on_tree)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            let keep_ones = self
+                .blooms
+                .iter()
+                .find(|(kk, _)| **kk == k)
+                .is_some_and(|(_, i)| !i.z_dirty);
+            let (b, is_new) = self.compute_bloom_for(k, keep_ones);
+            let Some(info) = self.blooms.get_mut(&k) else {
+                continue;
+            };
+            info.seq = info.seq.wrapping_add(1);
+            let should_send = is_new || info.seq >= 3600;
+            if should_send {
+                info.seq = 0;
+            }
+            if should_send {
+                let peers: Vec<Arc<dyn PeerHandle>> = self
+                    .peers
+                    .get(&k)
+                    .map_or_default(|v| v.iter().map(|e| Arc::clone(&e.handle)).collect());
+                for p in peers {
+                    p.send_bloom(&b);
+                }
+            }
+        }
+    }
+
+    /// Периодическое обслуживание. В Go это `_doMaintenance`; у нас пока
+    /// только Bloom'ы — `_fix`/`_sendAnnounces` придут со следующим этапом.
+    pub fn do_maintenance(&mut self) {
+        self.fix_blooms_on_tree();
+        self.send_all_blooms();
     }
 }

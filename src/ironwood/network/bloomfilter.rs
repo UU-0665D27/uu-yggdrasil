@@ -11,6 +11,7 @@ use crate::ironwood::{
         wire::{WireEncodable, wire_chop_slice},
     },
 };
+use std::collections::HashMap;
 
 /// Байт флагов «нулевой»/«все единицы» для чанков.
 pub const BLOOM_FILTER_F: usize = 16;
@@ -170,5 +171,65 @@ impl WireEncodable for Bloom {
             out.extend_from_slice(&chunk.to_be_bytes());
         }
         Ok(())
+    }
+}
+
+/// Состояние одного пира в `Blooms`.
+#[derive(Debug, Clone, Default)]
+pub struct BloomInfo {
+    /// Что мы последний раз отправили этому пиру.
+    pub send: Bloom,
+    /// Что мы получили от пира.
+    pub recv: Bloom,
+    /// Счётчик «давно не отправляли» (форс-ре-отправка раз в 3600 циклов).
+    pub seq: u16,
+    /// Пир на дереве (нам разрешено слать ему multicat'ы).
+    pub on_tree: bool,
+    /// Флаг «оставляем 1-биты» — защита от flapping'а.
+    pub z_dirty: bool,
+}
+
+/// `blooms` из `bloomfilter.go` — состояния всех пиров.
+#[derive(Debug, Default)]
+pub struct Blooms {
+    inner: HashMap<PublicKey, BloomInfo>,
+}
+
+impl Blooms {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_info(&mut self, key: PublicKey) {
+        self.inner.entry(key).or_default();
+    }
+
+    pub fn remove_info(&mut self, key: &PublicKey) {
+        self.inner.remove(key);
+    }
+
+    #[must_use]
+    pub fn on_tree(&self, key: &PublicKey) -> bool {
+        self.inner.get(key).is_some_and(|i| i.on_tree)
+    }
+
+    pub fn handle_bloom(&mut self, from: &PublicKey, b: Bloom) {
+        if let Some(info) = self.inner.get_mut(from) {
+            info.recv = b;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&PublicKey, &BloomInfo)> {
+        self.inner.iter()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &PublicKey) -> Option<&mut BloomInfo> {
+        self.inner.get_mut(key)
     }
 }

@@ -49,7 +49,9 @@ impl Ironwood {
     /// Возможные ошибки инициализации `Config`/`Crypto` (пока их нет — infallible).
     pub fn new(secret: &SigningKey, config: Config) -> Result<Arc<Self>, Error> {
         let crypto = Arc::new(Crypto::from_signing_key(secret.clone()));
-        let router = Router::new(Arc::clone(&crypto), config.clone());
+        let mut router = Router::new(Arc::clone(&crypto), config.clone());
+        // Сразу self-root'имся: без этого `lookup` не найдёт маршрута ни к кому.
+        router.become_root();
         Ok(Arc::new(Self {
             config,
             crypto,
@@ -61,6 +63,12 @@ impl Ironwood {
             shutdown: CancellationToken::new(),
             closed: AtomicBool::new(false),
         }))
+    }
+
+    /// Периодическое обслуживание. Вызывать из фоновой таски (или вручную
+    /// из тестов/фаззера).
+    pub fn do_maintenance(&self) {
+        self.router_lock().do_maintenance();
     }
 
     fn router_lock(&self) -> MutexGuard<'_, Router> {
@@ -98,6 +106,10 @@ impl Ironwood {
     /// делегируют сюда.
     fn dispatch_impl(&self, peer: &dyn PeerHandle, frame: InFrame) -> Result<(), Error> {
         match frame {
+            InFrame::Bloom(b) => {
+                self.router_lock().handle_bloom(peer, &b);
+                Ok(())
+            }
             InFrame::KeepAlive => Ok(()),
             InFrame::SigReq(req) => {
                 self.router_lock().handle_request(peer, &req);
@@ -109,10 +121,7 @@ impl Ironwood {
                     .handle_response(peer, &res, Duration::ZERO)
             }
             InFrame::Announce(ann) => self.router_lock().handle_announce(peer, &ann),
-            InFrame::Bloom(_)
-            | InFrame::PathLookup(_)
-            | InFrame::PathNotify(_)
-            | InFrame::PathBroken(_) => {
+            InFrame::PathLookup(_) | InFrame::PathNotify(_) | InFrame::PathBroken(_) => {
                 // TODO: blooms/pathfinder.
                 Ok(())
             }

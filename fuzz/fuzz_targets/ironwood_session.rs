@@ -40,6 +40,9 @@ fuzz_target!(|data: &[u8]| {
     let mut conn = Cursor::new(data[16..].to_vec());
     let _ = node.handle_conn_sync(&peer_key, &mut conn, 0);
 
+    // Упражняем Blooms + maintenance.
+    node.do_maintenance();
+
     // После выхода сессии узел должен быть консистентен.
     assert!(!node.is_closed());
     let _ = node.mtu();

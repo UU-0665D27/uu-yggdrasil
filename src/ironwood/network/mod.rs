@@ -11,7 +11,7 @@ pub mod router;
 pub mod traffic;
 pub mod wire;
 
-pub use bloomfilter::Bloom;
+pub use bloomfilter::{Bloom, BloomInfo, Blooms};
 pub use config::Config;
 pub use crypto::{Crypto, PrivateKey, PublicKey, Signature};
 pub use deadline::Deadline;
