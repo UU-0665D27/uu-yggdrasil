@@ -1,11 +1,12 @@
-// src/ironwood/signed.rs
-
-use crate::ironwood::errors::Error;
-use crate::ironwood::types::addr::KeyAddr;
-use crate::ironwood::types::packetconn::{PacketConn, PacketConnBase, ReadWrite};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use std::io;
-use std::sync::Arc;
+use crate::ironwood::{
+    errors::Error,
+    types::{
+        addr::KeyAddr,
+        packetconn::{PacketConn, PacketConnBase, ReadWrite},
+    },
+};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use std::{io, sync::Arc};
 
 /// Длина подписи Ed25519 (64 байта).
 const SIG_LEN: usize = Signature::BYTE_SIZE;
@@ -133,7 +134,7 @@ impl<P: PacketConn + Send + Sync + 'static> PacketConn for SignedPacketConn<P> {
 }
 #[doc(hidden)]
 pub mod fuzz {
-    use super::{SIG_LEN, SignedPacketConn};
+    use crate::ironwood::signed::SignedPacketConn;
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use std::sync::Arc;
 

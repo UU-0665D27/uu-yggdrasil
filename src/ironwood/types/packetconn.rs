@@ -1,10 +1,9 @@
-// src/ironwood/types/packetconn.rs
-
-use crate::ironwood::errors::Error;
-use crate::ironwood::types::addr::KeyAddr;
+use crate::ironwood::{errors::Error, types::addr::KeyAddr};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use std::io::{self, Read, Write};
-use std::sync::Arc;
+use std::{
+    io::{self, Read, Write},
+    sync::Arc,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Аналог `net.Conn` (TCP-like). Только для рантайма — в фаззере не нужен.
@@ -107,13 +106,21 @@ where
 // ────────────────────────────────────────────────────────────────────
 #[doc(hidden)]
 pub mod fuzz {
-    use super::{PacketConn, PacketConnBase, ReadWrite};
-    use crate::ironwood::errors::Error;
-    use crate::ironwood::types::addr::KeyAddr;
+    use crate::ironwood::{
+        errors::Error,
+        types::{
+            addr::KeyAddr,
+            packetconn::{PacketConn, PacketConnBase, ReadWrite},
+        },
+    };
     use ed25519_dalek::{SigningKey, VerifyingKey};
-    use std::io;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     /// Заглушка. Async-методы `PacketConnBase` возвращают `Err` —
     /// sync-ядро не должно их звать (исходящие датаграммы идут через
