@@ -69,3 +69,10 @@ path = "fuzz_targets/peer_session.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ironwood_session"
+path = "fuzz_targets/ironwood_session.rs"
+test = false
+doc = false
+bench = false

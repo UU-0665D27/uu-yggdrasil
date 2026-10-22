@@ -4,7 +4,10 @@ use std::{
     io::{self, Read, Write},
     sync::Arc,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    time::Instant,
+};
 
 /// Аналог `net.Conn` (TCP-like). Только для рантайма — в фаззере не нужен.
 pub trait AsyncConn: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -39,6 +42,25 @@ pub trait PacketConnBase: Send + Sync {
     /// # Errors
     /// Ошибка, если базовый сокет закрыт или адрес недоступен.
     fn local_addr(&self) -> io::Result<KeyAddr>;
+
+    /// # Errors
+    /// [`Error::CLOSED`] при повторном вызове.
+    fn close(&self) -> Result<(), Error>;
+
+    /// # Errors
+    /// Ошибка установки дедлайна.
+    fn set_read_deadline(&self, t: Option<Instant>) -> Result<(), Error>;
+
+    /// # Errors
+    /// Ошибка установки дедлайна.
+    fn set_write_deadline(&self, t: Option<Instant>) -> Result<(), Error>;
+
+    /// # Errors
+    /// Ошибка установки дедлайна.
+    fn set_deadline(&self, t: Option<Instant>) -> Result<(), Error> {
+        self.set_read_deadline(t)?;
+        self.set_write_deadline(t)
+    }
 }
 
 /// Синхронное ядро протокола. Именно его фаззим.
@@ -121,6 +143,7 @@ pub mod fuzz {
             atomic::{AtomicBool, Ordering},
         },
     };
+    use tokio::time::Instant;
 
     /// Заглушка. Async-методы `PacketConnBase` возвращают `Err` —
     /// sync-ядро не должно их звать (исходящие датаграммы идут через
@@ -156,6 +179,18 @@ pub mod fuzz {
         }
         fn local_addr(&self) -> io::Result<KeyAddr> {
             Ok(KeyAddr(self.key.verifying_key()))
+        }
+        fn close(&self) -> Result<(), Error> {
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return Err(Error::CLOSED);
+            }
+            Ok(())
+        }
+        fn set_read_deadline(&self, _t: Option<Instant>) -> Result<(), Error> {
+            Ok(())
+        }
+        fn set_write_deadline(&self, _t: Option<Instant>) -> Result<(), Error> {
+            Ok(())
         }
     }
 

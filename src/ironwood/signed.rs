@@ -7,6 +7,7 @@ use crate::ironwood::{
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::{io, sync::Arc};
+use tokio::time::Instant;
 
 /// Длина подписи Ed25519 (64 байта).
 const SIG_LEN: usize = Signature::BYTE_SIZE;
@@ -103,6 +104,15 @@ impl<P: PacketConn + Send + Sync + 'static> PacketConnBase for SignedPacketConn<
 
     fn local_addr(&self) -> io::Result<KeyAddr> {
         self.inner.local_addr()
+    }
+    fn close(&self) -> Result<(), Error> {
+        self.inner.close()
+    }
+    fn set_read_deadline(&self, t: Option<Instant>) -> Result<(), Error> {
+        self.inner.set_read_deadline(t)
+    }
+    fn set_write_deadline(&self, t: Option<Instant>) -> Result<(), Error> {
+        self.inner.set_write_deadline(t)
     }
 }
 
