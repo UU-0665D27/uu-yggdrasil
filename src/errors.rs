@@ -5,18 +5,18 @@ use std::fmt;
 pub struct Error(pub u32);
 
 impl Error {
-    pub const UNDEFINED: Error = Error(0);
-    pub const ENCODE: Error = Error(1);
-    pub const DECODE: Error = Error(2);
-    pub const Closed: Error = Error(3);
-    pub const Timeout: Error = Error(4);
-    pub const BadMessage: Error = Error(5);
-    pub const EmptyMessage: Error = Error(6);
-    pub const OversizedMessage: Error = Error(7);
-    pub const UnrecognizedMessage: Error = Error(8);
-    pub const PeerNotFound: Error = Error(9);
-    pub const BadAddress: Error = Error(10);
-    pub const BadKey: Error = Error(11);
+    pub const UNDEFINED: Self = Self(0);
+    pub const ENCODE: Self = Self(1);
+    pub const DECODE: Self = Self(2);
+    pub const CLOSED: Self = Self(3);
+    pub const TIMEOUT: Self = Self(4);
+    pub const BAD_MESSAGE: Self = Self(5);
+    pub const EMPTY_MESSAGE: Self = Self(6);
+    pub const OVERSIZED_MESSAGE: Self = Self(7);
+    pub const UNRECOGNIZED_MESSAGE: Self = Self(8);
+    pub const PEER_NOT_FOUND: Self = Self(9);
+    pub const BAD_ADDRESS: Self = Self(10);
+    pub const BAD_KEY: Self = Self(11);
 }
 
 impl fmt::Display for Error {
@@ -34,7 +34,7 @@ impl fmt::Display for Error {
             9 => f.write_str("ErrPeerNotFound"),
             10 => f.write_str("ErrBadAddress"),
             11 => f.write_str("ErrBadKey"),
-            n => write!(f, "Error({})", n),
+            n => write!(f, "Error({n})"),
         }
     }
 }
