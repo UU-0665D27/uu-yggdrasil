@@ -10,6 +10,7 @@ nursery="deny"
 perf="deny"
 
 [dependencies]
+async-trait = "0.1.92"
 ed25519-dalek = "3.0.0"
 tokio = { version = "1.54.1", features = ["full"] }
 tun = "0.8.14"
