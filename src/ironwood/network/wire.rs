@@ -43,6 +43,11 @@ impl WirePacketType {
         })
     }
 }
+impl From<WirePacketType> for u8 {
+    fn from(v: WirePacketType) -> Self {
+        v as Self
+    }
+}
 
 // ──────────────── varint ────────────────
 

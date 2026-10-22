@@ -784,6 +784,7 @@ name = "uu-yggdrasil-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "tokio",
  "uu-yggdrasil",
 ]
 

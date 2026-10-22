@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+tokio = { version = "1", features = ["sync"] }
 
 [dependencies.uu-yggdrasil]
 path = ".."
@@ -58,6 +59,13 @@ bench = false
 [[bin]]
 name = "bloomfilter"
 path = "fuzz_targets/bloomfilter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_session"
+path = "fuzz_targets/peer_session.rs"
 test = false
 doc = false
 bench = false
