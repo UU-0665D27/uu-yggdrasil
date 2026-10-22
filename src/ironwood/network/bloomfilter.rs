@@ -61,7 +61,7 @@ impl Bloom {
         let h2 = u64::from(u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
         for i in 0..BLOOM_FILTER_K {
             let combined = h1.wrapping_add(i.wrapping_mul(h2));
-            let bit = (combined % BLOOM_FILTER_M as u64) as usize;
+            let bit = usize::try_from(combined % BLOOM_FILTER_M as u64).unwrap_or(0);
             self.bits[bit / 64] |= 1u64 << (bit % 64);
         }
     }
@@ -82,7 +82,7 @@ impl Bloom {
         let h2 = u64::from(u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
         for i in 0..BLOOM_FILTER_K {
             let combined = h1.wrapping_add(i.wrapping_mul(h2));
-            let bit = (combined % BLOOM_FILTER_M as u64) as usize;
+            let bit = usize::try_from(combined % BLOOM_FILTER_M as u64).unwrap_or(0);
             if self.bits[bit / 64] & (1u64 << (bit % 64)) == 0 {
                 return false;
             }
@@ -106,7 +106,7 @@ impl Bloom {
         }
 
         let mut bits = [0u64; BLOOM_FILTER_U];
-        for idx in 0..BLOOM_FILTER_U {
+        for (idx, chunk) in bits.iter_mut().enumerate() {
             let byte = idx / 8;
             let mask = 0x80u8 >> (idx % 8);
             let is_zero = flags0[byte] & mask != 0;
@@ -114,16 +114,16 @@ impl Bloom {
             if is_zero && is_ones {
                 return Err(Error::DECODE);
             } else if is_zero {
-                // 0
+                // остаётся 0
             } else if is_ones {
-                bits[idx] = u64::MAX;
+                *chunk = u64::MAX;
             } else {
                 if rest.len() < 8 {
                     return Err(Error::DECODE);
                 }
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&rest[..8]);
-                bits[idx] = u64::from_be_bytes(buf);
+                *chunk = u64::from_be_bytes(buf);
                 rest = &rest[8..];
             }
         }

@@ -14,6 +14,7 @@ pub trait PqPacket: WireEncodable + Send {
 struct PqPacketInfo {
     packet: Box<dyn PqPacket>,
     size: u64,
+    #[allow(dead_code)]
     time: Instant,
 }
 
