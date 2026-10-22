@@ -7,7 +7,7 @@ pub mod traffic;
 pub mod wire;
 
 pub use config::Config;
-pub use crypto::{Crypto, PrivateKey, PublicKey};
+pub use crypto::{Crypto, PrivateKey, PublicKey, Signature};
 pub use deadline::Deadline;
 pub use packet_queue::{PacketQueue, PqPacket};
 pub use router::types::{RouterAnnounce, RouterInfo, RouterSigReq, RouterSigRes};
