@@ -12,11 +12,15 @@ use crypto_box::SalsaBox;
 use crate::ironwood::{
     encrypted::crypto::{
         BOX_OVERHEAD, BOX_PUB_SIZE, BoxPriv, BoxPub, ED_SIG_SIZE, EdPriv, EdPub, EdSig, GroupAuth,
-        box_open, box_seal, ed_check, ed_sign, ed25519_pub_to_curve25519, get_shared, new_box_keys,
+        box_open, box_seal, ed_check, ed_sign, ed25519_priv_to_curve25519,
+        ed25519_pub_to_curve25519, get_shared, new_box_keys,
     },
     network::wire::{wire_append_uint, wire_chop_uint},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 /// `sessionTimeout = time.Minute`.
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -527,14 +531,273 @@ impl SessionInfo {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// SessionManager
+// ════════════════════════════════════════════════════════════════════
+
+/// События, которые `SessionManager` возвращает наружу.
+///
+/// `Send` — отправить `data` на `dest` через `network::PacketConn::send_to`.
+/// `Deliver` — входящий расшифрованный payload, доставить в `ReadFrom`.
+pub enum SessionEvent {
+    /// Wire-фрейм для отправки через `network::PacketConn::send_to`.
+    Send { dest: EdPub, data: Vec<u8> },
+    /// Расшифрованный payload — доставить в `ReadFrom`-очередь.
+    Deliver { from: EdPub, payload: Vec<u8> },
+}
+
+/// `sessionManager`: держит `sessions` и `buffers`, управляет handshake'ом.
+///
+/// Не знает про `network::PacketConn` — возвращает `SessionEvent::Send`,
+/// а caller сам делает `send_to`. В этом отличие от Go-версии, где
+/// `mgr.pc.PacketConn.WriteTo` вызывается напрямую.
+pub struct SessionManager {
+    secret_ed: EdPriv,
+    secret_box: BoxPriv,
+    group_auth: GroupAuth,
+    sessions: HashMap<EdPub, SessionInfo>,
+    buffers: HashMap<EdPub, SessionBuffer>,
+}
+
+impl SessionManager {
+    #[must_use]
+    pub fn new(secret_ed: EdPriv, group_auth: GroupAuth) -> Self {
+        let secret_box = ed25519_priv_to_curve25519(&secret_ed);
+        Self {
+            secret_ed,
+            secret_box,
+            group_auth,
+            sessions: HashMap::new(),
+            buffers: HashMap::new(),
+        }
+    }
+
+    /// `handleData(from, data)`. Возвращает события для диспетчеризации.
+    #[must_use]
+    pub fn handle_data(&mut self, from: EdPub, data: &[u8], now: Instant) -> Vec<SessionEvent> {
+        let mut out = Vec::new();
+        if data.is_empty() {
+            return out;
+        }
+        match data[0] {
+            SESSION_TYPE_DUMMY => {}
+            SESSION_TYPE_INIT => {
+                let mut init = SessionInit::new([0u8; 32], [0u8; 32], 0);
+                if init.decrypt(&self.secret_box, &from, data, &self.group_auth) {
+                    self.handle_init(from, &init, now, &mut out);
+                }
+            }
+            SESSION_TYPE_ACK => {
+                let mut ack_init = SessionInit::new([0u8; 32], [0u8; 32], 0);
+                if ack_init.decrypt(&self.secret_box, &from, data, &self.group_auth) {
+                    let ack = SessionAck::new(ack_init);
+                    self.handle_ack(from, &ack, now, &mut out);
+                }
+            }
+            SESSION_TYPE_TRAFFIC => {
+                self.handle_traffic(from, data, now, &mut out);
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// `writeTo(toKey, msg)` — отправить `msg` на `toKey`.
+    /// Если сессии нет — создаёт буфер, отправляет `sessionInit`,
+    /// а `msg` откладывает до установки сессии.
+    #[must_use]
+    pub fn write_to(&mut self, to: EdPub, msg: Vec<u8>, now: Instant) -> Vec<SessionEvent> {
+        let mut out = Vec::new();
+        if let Some(session) = self.sessions.get_mut(&to) {
+            let wire = session.do_send(&msg, now);
+            out.push(SessionEvent::Send {
+                dest: to,
+                data: wire,
+            });
+        } else {
+            self.buffer_and_init(to, msg, now, &mut out);
+        }
+        out
+    }
+
+    /// `_handleInit(pub, init)`.
+    fn handle_init(
+        &mut self,
+        from: EdPub,
+        init: &SessionInit,
+        now: Instant,
+        out: &mut Vec<SessionEvent>,
+    ) {
+        let buffered_data = self.session_for_init(from, init, now);
+        if let Some(session) = self.sessions.get_mut(&from) {
+            if let Some(ack_wire) =
+                session.handle_init(init, &self.secret_ed, &self.group_auth, now)
+            {
+                out.push(SessionEvent::Send {
+                    dest: from,
+                    data: ack_wire,
+                });
+            }
+            if let Some(msg) = buffered_data {
+                let wire = session.do_send(&msg, now);
+                out.push(SessionEvent::Send {
+                    dest: from,
+                    data: wire,
+                });
+            }
+        }
+    }
+
+    /// `_handleAck(pub, ack)`.
+    fn handle_ack(
+        &mut self,
+        from: EdPub,
+        ack: &SessionAck,
+        now: Instant,
+        out: &mut Vec<SessionEvent>,
+    ) {
+        let was_old = self.sessions.contains_key(&from);
+        let buffered_data = self.session_for_init(from, &ack.init, now);
+        if let Some(session) = self.sessions.get_mut(&from) {
+            if was_old {
+                session.handle_ack(ack, now);
+            } else if let Some(ack_wire) =
+                session.handle_init(&ack.init, &self.secret_ed, &self.group_auth, now)
+            {
+                out.push(SessionEvent::Send {
+                    dest: from,
+                    data: ack_wire,
+                });
+            }
+            if let Some(msg) = buffered_data {
+                let wire = session.do_send(&msg, now);
+                out.push(SessionEvent::Send {
+                    dest: from,
+                    data: wire,
+                });
+            }
+        }
+    }
+
+    /// `_handleTraffic(pub, msg)`.
+    fn handle_traffic(
+        &mut self,
+        from: EdPub,
+        data: &[u8],
+        now: Instant,
+        out: &mut Vec<SessionEvent>,
+    ) {
+        if let Some(session) = self.sessions.get_mut(&from) {
+            match session.do_recv(data, now) {
+                RecvResult::Delivered(payload) => {
+                    out.push(SessionEvent::Deliver { from, payload });
+                }
+                RecvResult::NeedsInit => {
+                    let init_wire = session.build_init(&self.secret_ed, &self.group_auth);
+                    out.push(SessionEvent::Send {
+                        dest: from,
+                        data: init_wire,
+                    });
+                }
+                RecvResult::Drop => {}
+            }
+        } else {
+            // Сессии нет — вероятно, спуф/реплей. Не сохраняем сессию
+            // и не буферизуем; шлём «слепой» init, чтобы пир прислал ack
+            // и инициировал установку. Ключи забываем.
+            let (cur_pub, _cur_priv) = new_box_keys();
+            let (nxt_pub, _nxt_priv) = new_box_keys();
+            let init = SessionInit::new(cur_pub, nxt_pub, 0);
+            let wire = init.encrypt(&self.secret_ed, &from, &self.group_auth);
+            out.push(SessionEvent::Send {
+                dest: from,
+                data: wire,
+            });
+        }
+    }
+
+    /// `_sessionForInit(pub, init)`: создать сессию (или ничего, если уже
+    /// есть), трансплантировать ключи из буфера, вернуть отложенные данные.
+    fn session_for_init(
+        &mut self,
+        from: EdPub,
+        init: &SessionInit,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        if self.sessions.contains_key(&from) {
+            return None;
+        }
+
+        let mut session = SessionInfo::new(from, init.current, init.next, init.seq, now);
+
+        let buffered_data = if let Some(mut buf) = self.buffers.remove(&from) {
+            session.send_pub = buf.init.current;
+            session.send_priv = buf.current_priv;
+            session.next_pub = buf.init.next;
+            session.next_priv = buf.next_priv;
+            session.fix_shared(0, 0);
+            buf.data.take()
+        } else {
+            None
+        };
+
+        self.sessions.insert(from, session);
+        buffered_data
+    }
+
+    /// `_bufferAndInit(toKey, msg)`.
+    fn buffer_and_init(
+        &mut self,
+        to: EdPub,
+        msg: Vec<u8>,
+        now: Instant,
+        out: &mut Vec<SessionEvent>,
+    ) {
+        let buf = self
+            .buffers
+            .entry(to)
+            .or_insert_with(|| SessionBuffer::new(now));
+        buf.data = Some(msg);
+        buf.last_seen = now;
+        let init_wire = buf.init.encrypt(&self.secret_ed, &to, &self.group_auth);
+        out.push(SessionEvent::Send {
+            dest: to,
+            data: init_wire,
+        });
+    }
+
+    /// Пройтись по сессиям и буферам, удалить просроченные.
+    pub fn do_maintenance(&mut self, now: Instant) {
+        self.buffers.retain(|_, buf| !buf.is_expired(now));
+        self.sessions.retain(|_, session| !session.is_expired(now));
+    }
+
+    /// Количество активных сессий (для отладки).
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+    /// Количество ожидающих буферов.
+    #[must_use]
+    pub fn buffer_count(&self) -> usize {
+        self.buffers.len()
+    }
+}
+
 /// `_ = Error` — на будущее (например, `Error::ENCODE` при создании
 /// сессии в manager'е). Пока не нужен.
 const _: () = ();
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ironwood::encrypted::crypto::{GroupAuth, ed25519_priv_to_curve25519, new_box_keys};
+    use crate::ironwood::encrypted::{
+        crypto::{EdPriv, GroupAuth, ed25519_priv_to_curve25519, new_box_keys},
+        session::{
+            RecvResult, SESSION_ACK_SIZE, SESSION_INIT_SIZE, SESSION_TIMEOUT, SESSION_TYPE_ACK,
+            SESSION_TYPE_INIT, SessionAck, SessionBuffer, SessionEvent, SessionInfo, SessionInit,
+            SessionManager,
+        },
+    };
 
     #[test]
     fn init_roundtrip() {
@@ -639,5 +902,63 @@ mod tests {
         assert!(!buf.is_expired(now));
         assert!(buf.is_expired(now + SESSION_TIMEOUT));
         assert!(buf.is_expired(now + SESSION_TIMEOUT + std::time::Duration::from_secs(1)));
+    }
+    #[test]
+    fn manager_two_party_handshake() {
+        let alice_ed = EdPriv::from_bytes(&[0x51u8; 32]);
+        let bob_ed = EdPriv::from_bytes(&[0x52u8; 32]);
+        let alice_pub = alice_ed.verifying_key();
+        let bob_pub = bob_ed.verifying_key();
+        let now = std::time::Instant::now();
+        let auth = GroupAuth::new("");
+
+        let mut alice = SessionManager::new(alice_ed, auth.clone());
+        let mut bob = SessionManager::new(bob_ed, auth);
+
+        // Alice шлёт Bob'у — сессии нет, должен пойти init.
+        let events = alice.write_to(bob_pub, b"hello".to_vec(), now);
+        assert_eq!(events.len(), 1);
+        let SessionEvent::Send { dest, data } = &events[0] else {
+            panic!("expected Send");
+        };
+        assert_eq!(*dest, bob_pub);
+        let init_wire = data.clone();
+
+        // Bob получает init → должен создать сессию и отправить ack.
+        let events = bob.handle_data(alice_pub, &init_wire, now);
+        assert_eq!(events.len(), 1);
+        let SessionEvent::Send { data: ack_wire, .. } = &events[0] else {
+            panic!("expected ack Send");
+        };
+        let ack_wire = ack_wire.clone();
+        assert_eq!(bob.session_count(), 1);
+
+        // Alice получает ack → создаёт сессию + отправляет отложенный hello.
+        let events = alice.handle_data(bob_pub, &ack_wire, now);
+        assert_eq!(alice.session_count(), 1);
+        // Один из событий должен быть отправкой traffic'а (не ack).
+        let traffic_send = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::Send { .. }))
+            .expect("alice should send traffic");
+        let SessionEvent::Send {
+            data: traffic_wire, ..
+        } = traffic_send
+        else {
+            unreachable!()
+        };
+        let traffic_wire = traffic_wire.clone();
+
+        // Bob получает traffic → должен доставить "hello".
+        let events = bob.handle_data(alice_pub, &traffic_wire, now);
+        let delivered = events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Deliver { from, payload } => Some((*from, payload.clone())),
+                _ => None,
+            })
+            .expect("bob should deliver payload");
+        assert_eq!(delivered.0, alice_pub);
+        assert_eq!(delivered.1, b"hello");
     }
 }
