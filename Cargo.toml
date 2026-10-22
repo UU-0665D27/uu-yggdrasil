@@ -12,6 +12,7 @@ perf="deny"
 [dependencies]
 async-trait = "0.1.92"
 ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io-util"] }
 tun = "0.8.14"
