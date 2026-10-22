@@ -26,3 +26,10 @@ path = "fuzz_targets/signed_unpack.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
