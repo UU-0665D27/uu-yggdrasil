@@ -7,9 +7,14 @@
 //! `sig` — Ed25519-подпись от `fromBoxPub || current || next || keySeq || seq`,
 //! с `groupAuth.preimage()` в качестве префикса.
 
-use crate::ironwood::encrypted::crypto::{
-    BOX_OVERHEAD, BOX_PUB_SIZE, BoxPriv, BoxPub, ED_SIG_SIZE, EdPriv, EdPub, EdSig, GroupAuth,
-    box_open, box_seal, ed_check, ed_sign, ed25519_pub_to_curve25519, get_shared, new_box_keys,
+use crypto_box::SalsaBox;
+
+use crate::ironwood::{
+    encrypted::crypto::{
+        BOX_OVERHEAD, BOX_PUB_SIZE, BoxPriv, BoxPub, ED_SIG_SIZE, EdPriv, EdPub, EdSig, GroupAuth,
+        box_open, box_seal, ed_check, ed_sign, ed25519_pub_to_curve25519, get_shared, new_box_keys,
+    },
+    network::wire::{wire_append_uint, wire_chop_uint},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -175,9 +180,357 @@ impl SessionAck {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// SessionBuffer
+// ════════════════════════════════════════════════════════════════════
+
+/// `sessionBuffer` — отложенный трафик и priv-ключи для не-установленной сессии.
+pub struct SessionBuffer {
+    /// Трафик, ожидающий установления сессии.
+    pub data: Option<Vec<u8>>,
+    /// Init, который мы отправили.
+    pub init: SessionInit,
+    /// Приватный ключ, парный к `init.current`.
+    pub current_priv: BoxPriv,
+    /// Приватный ключ, парный к `init.next`.
+    pub next_priv: BoxPriv,
+    /// Момент последней активности (для expiry).
+    pub last_seen: std::time::Instant,
+}
+
+impl SessionBuffer {
+    #[must_use]
+    pub fn new(now: std::time::Instant) -> Self {
+        let (current_pub, current_priv) = new_box_keys();
+        let (next_pub, next_priv) = new_box_keys();
+        Self {
+            data: None,
+            init: SessionInit::new(current_pub, next_pub, 0),
+            current_priv,
+            next_priv,
+            last_seen: now,
+        }
+    }
+
+    #[must_use]
+    pub fn is_expired(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.last_seen) >= SESSION_TIMEOUT
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// RecvResult
+// ════════════════════════════════════════════════════════════════════
+
+/// Результат `SessionInfo::do_recv`.
+pub enum RecvResult {
+    /// Расшифровано — приложить к приёмной очереди.
+    Delivered(Vec<u8>),
+    /// Мы вне синхронизации — надо отослать `sessionInit`.
+    NeedsInit,
+    /// Пакет дублирующий, битый или непонятный — молча дроп.
+    Drop,
+}
+
+// ════════════════════════════════════════════════════════════════════
+// SessionInfo
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+enum RotateMode {
+    CurrentRecv,
+    NextSend,
+    NextRecv,
+}
+
+/// `sessionInfo` — полное состояние ratchet'а.
+pub struct SessionInfo {
+    // Remote.
+    pub ed: EdPub,
+    pub seq: u64,
+    pub remote_key_seq: u64,
+    pub current: BoxPub,
+    pub next: BoxPub,
+
+    // Local.
+    pub local_key_seq: u64,
+    pub recv_pub: BoxPub,
+    pub recv_priv: BoxPriv,
+    pub recv_shared: SalsaBox,
+    pub recv_nonce: u64,
+    pub send_pub: BoxPub,
+    pub send_priv: BoxPriv,
+    pub send_shared: SalsaBox,
+    pub send_nonce: u64,
+    pub next_priv: BoxPriv,
+    pub next_pub: BoxPub,
+
+    // Ratchet-forward.
+    pub next_send_shared: SalsaBox,
+    pub next_send_nonce: u64,
+    pub next_recv_shared: SalsaBox,
+    pub next_recv_nonce: u64,
+
+    // Misc.
+    pub since: std::time::Instant,
+    pub rotated: Option<std::time::Instant>,
+    pub last_seen: std::time::Instant,
+    pub rx: u64,
+    pub tx: u64,
+}
+
+impl SessionInfo {
+    #[must_use]
+    pub fn new(
+        ed: EdPub,
+        current: BoxPub,
+        next: BoxPub,
+        seq: u64,
+        now: std::time::Instant,
+    ) -> Self {
+        let (recv_pub, recv_priv) = new_box_keys();
+        let (send_pub, send_priv) = new_box_keys();
+        let (next_pub, next_priv) = new_box_keys();
+        let recv_shared = get_shared(&current, &recv_priv);
+        let send_shared = get_shared(&current, &send_priv);
+        let next_send_shared = get_shared(&next, &send_priv);
+        let next_recv_shared = get_shared(&next, &recv_priv);
+        Self {
+            ed,
+            seq: seq.wrapping_sub(1),
+            remote_key_seq: 0,
+            current,
+            next,
+            local_key_seq: 0,
+            recv_pub,
+            recv_priv,
+            recv_shared,
+            recv_nonce: 0,
+            send_pub,
+            send_priv,
+            send_shared,
+            send_nonce: 0,
+            next_priv,
+            next_pub,
+            next_send_shared,
+            next_send_nonce: 0,
+            next_recv_shared,
+            next_recv_nonce: 0,
+            since: now,
+            rotated: None,
+            last_seen: now,
+            rx: 0,
+            tx: 0,
+        }
+    }
+
+    fn fix_shared(&mut self, recv_nonce: u64, send_nonce: u64) {
+        self.recv_shared = get_shared(&self.current, &self.recv_priv);
+        self.send_shared = get_shared(&self.current, &self.send_priv);
+        self.next_send_shared = get_shared(&self.next, &self.send_priv);
+        self.next_recv_shared = get_shared(&self.next, &self.recv_priv);
+        self.next_send_nonce = 0;
+        self.next_recv_nonce = 0;
+        self.recv_nonce = recv_nonce;
+        self.send_nonce = send_nonce;
+    }
+
+    /// `_handleUpdate`: применить init/ack, прокрутить наши ключи вперёд.
+    pub fn handle_update(&mut self, init: &SessionInit, now: std::time::Instant) {
+        self.current = init.current;
+        self.next = init.next;
+        self.seq = init.seq;
+        self.remote_key_seq = init.key_seq;
+
+        self.recv_pub = self.send_pub;
+        self.recv_priv = self.send_priv;
+        self.send_pub = self.next_pub;
+        self.send_priv = self.next_priv;
+        let (np, npr) = new_box_keys();
+        self.next_pub = np;
+        self.next_priv = npr;
+        self.local_key_seq = self.local_key_seq.wrapping_add(1);
+
+        let sn = self.send_nonce;
+        self.fix_shared(0, sn);
+        self.last_seen = now;
+    }
+
+    fn maybe_rotate(&mut self, inner_key: BoxPub, nonce: u64, now: std::time::Instant) {
+        let should_rotate = self
+            .rotated
+            .is_none_or(|t| now.duration_since(t) > std::time::Duration::from_secs(60));
+        if !should_rotate {
+            return;
+        }
+        self.current = self.next;
+        self.next = inner_key;
+        self.remote_key_seq = self.remote_key_seq.wrapping_add(1);
+        self.recv_pub = self.send_pub;
+        self.recv_priv = self.send_priv;
+        self.send_pub = self.next_pub;
+        self.send_priv = self.next_priv;
+        let (np, npr) = new_box_keys();
+        self.next_pub = np;
+        self.next_priv = npr;
+        self.local_key_seq = self.local_key_seq.wrapping_add(1);
+        self.fix_shared(nonce, 0);
+        self.rotated = Some(now);
+    }
+
+    /// `doSend`: зашифровать `msg`, вернуть готовый wire-пакет.
+    pub fn do_send(&mut self, msg: &[u8], now: std::time::Instant) -> Vec<u8> {
+        self.send_nonce = self.send_nonce.wrapping_add(1);
+        if self.send_nonce == 0 {
+            self.recv_pub = self.send_pub;
+            self.recv_priv = self.send_priv;
+            self.send_pub = self.next_pub;
+            self.send_priv = self.next_priv;
+            let (np, npr) = new_box_keys();
+            self.next_pub = np;
+            self.next_priv = npr;
+            self.local_key_seq = self.local_key_seq.wrapping_add(1);
+            self.fix_shared(0, 0);
+        }
+
+        let mut out = vec![SESSION_TYPE_TRAFFIC];
+        wire_append_uint(&mut out, self.local_key_seq);
+        wire_append_uint(&mut out, self.remote_key_seq);
+        wire_append_uint(&mut out, self.send_nonce);
+
+        let mut plaintext = Vec::with_capacity(BOX_PUB_SIZE + msg.len());
+        plaintext.extend_from_slice(&self.next_pub);
+        plaintext.extend_from_slice(msg);
+
+        let boxed = box_seal(&self.send_shared, &plaintext, self.send_nonce);
+        out.extend_from_slice(&boxed);
+        self.tx += msg.len() as u64;
+        self.last_seen = now;
+        out
+    }
+
+    /// `doRecv`: расшифровать входящий wire-пакет.
+    pub fn do_recv(&mut self, msg: &[u8], now: std::time::Instant) -> RecvResult {
+        if msg.len() < SESSION_TRAFFIC_OVERHEAD_MIN || msg[0] != SESSION_TYPE_TRAFFIC {
+            return RecvResult::Drop;
+        }
+        let mut slice = &msg[1..];
+        let Some(remote_key_seq) = wire_chop_uint(&mut slice) else {
+            return RecvResult::Drop;
+        };
+        let Some(local_key_seq) = wire_chop_uint(&mut slice) else {
+            return RecvResult::Drop;
+        };
+        let Some(nonce) = wire_chop_uint(&mut slice) else {
+            return RecvResult::Drop;
+        };
+        let boxed = slice;
+
+        let from_current = remote_key_seq == self.remote_key_seq;
+        let from_next = remote_key_seq == self.remote_key_seq.wrapping_add(1);
+        let to_recv = local_key_seq.wrapping_add(1) == self.local_key_seq;
+        let to_send = local_key_seq == self.local_key_seq;
+
+        let mode = if from_current && to_recv {
+            if self.recv_nonce >= nonce {
+                return RecvResult::Drop;
+            }
+            RotateMode::CurrentRecv
+        } else if from_next && to_send {
+            if self.next_send_nonce >= nonce {
+                return RecvResult::Drop;
+            }
+            RotateMode::NextSend
+        } else if from_next && to_recv {
+            if self.next_recv_nonce >= nonce {
+                return RecvResult::Drop;
+            }
+            RotateMode::NextRecv
+        } else {
+            return RecvResult::NeedsInit;
+        };
+
+        let shared = match mode {
+            RotateMode::CurrentRecv => &self.recv_shared,
+            RotateMode::NextSend => &self.next_send_shared,
+            RotateMode::NextRecv => &self.next_recv_shared,
+        };
+
+        let Some(plaintext) = box_open(shared, boxed, nonce) else {
+            return RecvResult::NeedsInit;
+        };
+        if plaintext.len() < BOX_PUB_SIZE {
+            return RecvResult::Drop;
+        }
+        let mut inner_key = [0u8; BOX_PUB_SIZE];
+        inner_key.copy_from_slice(&plaintext[..BOX_PUB_SIZE]);
+        let payload = plaintext[BOX_PUB_SIZE..].to_vec();
+
+        match mode {
+            RotateMode::CurrentRecv => {
+                self.recv_nonce = nonce;
+            }
+            RotateMode::NextSend => {
+                self.next_send_nonce = nonce;
+                self.maybe_rotate(inner_key, nonce, now);
+            }
+            RotateMode::NextRecv => {
+                self.next_recv_nonce = nonce;
+                self.maybe_rotate(inner_key, nonce, now);
+            }
+        }
+        self.rx += payload.len() as u64;
+        self.last_seen = now;
+        RecvResult::Delivered(payload)
+    }
+
+    /// `_sendInit`.
+    #[must_use]
+    pub fn build_init(&self, secret_ed: &EdPriv, group_auth: &GroupAuth) -> Vec<u8> {
+        let init = SessionInit::new(self.send_pub, self.next_pub, self.local_key_seq);
+        init.encrypt(secret_ed, &self.ed, group_auth)
+    }
+
+    /// `_sendAck`.
+    #[must_use]
+    pub fn build_ack(&self, secret_ed: &EdPriv, group_auth: &GroupAuth) -> Vec<u8> {
+        let init = SessionInit::new(self.send_pub, self.next_pub, self.local_key_seq);
+        SessionAck::new(init).encrypt(secret_ed, &self.ed, group_auth)
+    }
+
+    /// `handleInit`: обновить состояние + вернуть байты ack'а.
+    pub fn handle_init(
+        &mut self,
+        init: &SessionInit,
+        secret_ed: &EdPriv,
+        group_auth: &GroupAuth,
+        now: std::time::Instant,
+    ) -> Option<Vec<u8>> {
+        if init.seq <= self.seq {
+            return None;
+        }
+        self.handle_update(init, now);
+        Some(self.build_ack(secret_ed, group_auth))
+    }
+
+    /// `handleAck`: обновить состояние (без ack'а назад).
+    pub fn handle_ack(&mut self, ack: &SessionAck, now: std::time::Instant) {
+        if ack.init.seq <= self.seq {
+            return;
+        }
+        self.handle_update(&ack.init, now);
+    }
+
+    #[must_use]
+    pub fn is_expired(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.last_seen) >= SESSION_TIMEOUT
+    }
+}
+
 /// `_ = Error` — на будущее (например, `Error::ENCODE` при создании
 /// сессии в manager'е). Пока не нужен.
 const _: () = ();
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +600,44 @@ mod tests {
         let wire = ack.encrypt(&alice_sk, &bob_pk, &GroupAuth::new(""));
         assert_eq!(wire.len(), SESSION_ACK_SIZE);
         assert_eq!(wire[0], SESSION_TYPE_ACK);
+    }
+    #[test]
+    fn session_traffic_normal_case() {
+        let (common_pub, common_priv) = new_box_keys();
+        let ed_pub = EdPriv::from_bytes(&[0x11u8; 32]).verifying_key();
+        let now = std::time::Instant::now();
+
+        // Bob: local=1, remote=0 (он на своей текущей, думает что alice на 0)
+        let mut bob = SessionInfo::new(ed_pub, common_pub, common_pub, 0, now);
+        bob.send_priv = common_priv;
+        bob.send_pub = common_pub;
+        bob.local_key_seq = 1;
+        bob.remote_key_seq = 0;
+        bob.fix_shared(0, 0);
+
+        // Alice: local=1, remote=1 (думает что bob на 1 - т.е. отстаёт на 1)
+        let mut alice = SessionInfo::new(ed_pub, common_pub, common_pub, 0, now);
+        alice.recv_priv = common_priv;
+        alice.recv_pub = common_pub;
+        alice.local_key_seq = 1;
+        alice.remote_key_seq = 1;
+        alice.fix_shared(0, 0);
+
+        // bob.send_shared == alice.recv_shared, потому что оба используют
+        // DH(common_pub, common_priv).
+        let wire = bob.do_send(b"hello", now);
+        match alice.do_recv(&wire, now) {
+            RecvResult::Delivered(data) => assert_eq!(data, b"hello"),
+            _ => panic!("expected delivery"),
+        }
+    }
+
+    #[test]
+    fn session_buffer_expiry() {
+        let now = std::time::Instant::now();
+        let buf = SessionBuffer::new(now);
+        assert!(!buf.is_expired(now));
+        assert!(buf.is_expired(now + SESSION_TIMEOUT));
+        assert!(buf.is_expired(now + SESSION_TIMEOUT + std::time::Duration::from_secs(1)));
     }
 }
