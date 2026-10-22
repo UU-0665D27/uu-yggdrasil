@@ -47,3 +47,17 @@ path = "fuzz_targets/packet_queue.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "pathfinder"
+path = "fuzz_targets/pathfinder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bloomfilter"
+path = "fuzz_targets/bloomfilter.rs"
+test = false
+doc = false
+bench = false
