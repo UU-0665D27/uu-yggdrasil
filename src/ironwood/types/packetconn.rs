@@ -1,9 +1,9 @@
 // src/ironwood/types/packetconn.rs
 
 use crate::ironwood::errors::Error;
+use crate::ironwood::types::addr::KeyAddr;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -17,21 +17,29 @@ pub trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
 /// Аналог `net.PacketConn` (датаграммы, async — для рантайма).
+/// Адресация — по ed25519-ключу (`KeyAddr`), как в ironwood Go.
 #[async_trait::async_trait]
 pub trait PacketConnBase: Send + Sync {
+    /// Принимает одну датаграмму в `buf` и возвращает её длину и адрес отправителя.
+    ///
     /// # Errors
     /// Ошибка ввода-вывода, если сокет закрыт, дедлайн истёк
     /// или чтение завершилось неудачей.
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, KeyAddr)>;
 
+    /// Отправляет `buf` на `addr` и возвращает число записанных байт
+    /// (без учёта заголовков транспорта — по смыслу это `buf.len()`).
+    ///
     /// # Errors
     /// Ошибка ввода-вывода, если сокет закрыт, дедлайн истёк
     /// или запись завершилась неудачей.
-    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize>;
+    async fn send_to(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize>;
 
+    /// Возвращает локальный адрес, к которому привязан сокет.
+    ///
     /// # Errors
     /// Ошибка, если базовый сокет закрыт или адрес недоступен.
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> io::Result<KeyAddr>;
 }
 
 /// Синхронное ядро протокола. Именно его фаззим.
@@ -65,10 +73,11 @@ pub trait PacketConn: PacketConnBase {
 
 /// Async-обёртка над sync-ядром. Внутри — `spawn_blocking` + `SyncIoBridge`.
 ///
-/// Требует `tokio-util = { version = "0.7", features = ["io"] }`.
+/// Требует `tokio-util = { version = "0.7", features = ["io-util"] }`.
 ///
 /// # Errors
-/// Пробрасывает ошибку из `handle_conn_sync`.
+/// Пробрасывает ошибку из `handle_conn_sync`. Паника внутри протокола
+/// не маскируется — она перебрасывается в вызывающий код.
 pub async fn handle_conn_async<P>(
     pc: Arc<P>,
     key: VerifyingKey,
@@ -100,9 +109,9 @@ where
 pub mod fuzz {
     use super::{PacketConn, PacketConnBase, ReadWrite};
     use crate::ironwood::errors::Error;
+    use crate::ironwood::types::addr::KeyAddr;
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use std::io;
-    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -132,14 +141,14 @@ pub mod fuzz {
 
     #[async_trait::async_trait]
     impl PacketConnBase for FuzzPacketConn {
-        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, KeyAddr)> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "sync path"))
         }
-        async fn send_to(&self, _buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+        async fn send_to(&self, _buf: &[u8], _addr: &KeyAddr) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "sync path"))
         }
-        fn local_addr(&self) -> io::Result<SocketAddr> {
-            Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
+        fn local_addr(&self) -> io::Result<KeyAddr> {
+            Ok(KeyAddr(self.key.verifying_key()))
         }
     }
 
