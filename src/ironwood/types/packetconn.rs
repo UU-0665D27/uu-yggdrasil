@@ -1,73 +1,188 @@
+// src/ironwood/types/packetconn.rs
+
 use crate::ironwood::errors::Error;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use std::{io, net::SocketAddr, sync::Arc};
+use std::io::{self, Read, Write};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// Аналог net.Conn с TCP-подобной семантикой (reliable ordered).
-/// В tokio std-трейта `net.Conn` нет, поэтому вводим свой alias.
+/// Аналог `net.Conn` (TCP-like). Только для рантайма — в фаззере не нужен.
 pub trait AsyncConn: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncConn for T {}
 
-/// Аналог net.PacketConn.
-/// `tokio::net::UdpSocket` — конкретный тип, трейта нет → свой.
-/// Закрытие — через Drop сокета, отдельного `close()` не нужно.
+/// Синхронный байтовый поток. Интерфейс sync-ядра протокола и фаззера.
+/// `Cursor<Vec<u8>>`, `TcpStream`, `SyncIoBridge<_>` — все подходят.
+pub trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// Аналог `net.PacketConn` (датаграммы, async — для рантайма).
 #[async_trait::async_trait]
 pub trait PacketConnBase: Send + Sync {
-    /// Принимает одну датаграмму в `buf` и возвращает её длину и адрес отправителя.
-    ///
     /// # Errors
-    ///
-    /// Возвращает ошибку ввода-вывода, если сокет закрыт, дедлайн истёк
+    /// Ошибка ввода-вывода, если сокет закрыт, дедлайн истёк
     /// или чтение завершилось неудачей.
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
 
-    /// Отправляет `buf` на `addr` и возвращает число записанных байт.
-    ///
     /// # Errors
-    ///
-    /// Возвращает ошибку ввода-вывода, если сокет закрыт, дедлайн истёк
+    /// Ошибка ввода-вывода, если сокет закрыт, дедлайн истёк
     /// или запись завершилась неудачей.
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize>;
 
-    /// Возвращает локальный адрес, к которому привязан сокет.
-    ///
     /// # Errors
-    ///
-    /// Возвращает ошибку, если базовый сокет закрыт или адрес недоступен.
+    /// Ошибка, если базовый сокет закрыт или адрес недоступен.
     fn local_addr(&self) -> io::Result<SocketAddr>;
 }
 
-#[async_trait::async_trait]
+/// Синхронное ядро протокола. Именно его фаззим.
 pub trait PacketConn: PacketConnBase {
-    /// Блокируется (await'ится), пока `conn` используется.
-    /// Завершается почти сразу после вызова `close()` на `PacketConn`.
-    /// `conn` закрывается до возврата — владение передаётся внутрь,
-    /// Drop закроет сокет.
+    /// Обрабатывает одно TCP-подобное соединение до EOF или ошибки.
+    /// Блокирующая, синхронная — можно гонять без tokio-рантайма.
     ///
     /// # Errors
-    ///
-    /// Возвращает:
-    /// - [`Error::CLOSED`] — если `PacketConn` был закрыт во время работы сессии;
-    /// - ошибку протокола/кодирования (см. варианты [`Error`]) при сбое обработки;
-    /// - ошибку ввода-вывода, если `conn` вернул её до штатного завершения.
-    async fn handle_conn(
+    /// - [`Error::CLOSED`] — если `PacketConn` закрыт во время работы;
+    /// - варианты [`Error`] при сбое протокола/кодирования;
+    /// - IO-ошибки, если `conn` вернул их до штатного завершения.
+    fn handle_conn_sync(
         &self,
         key: &VerifyingKey,
-        conn: Box<dyn AsyncConn>,
+        conn: &mut dyn ReadWrite,
         prio: u8,
     ) -> Result<(), Error>;
 
-    /// `true` ⇔ соединение закрыто. Не блокируется, не await'ится.
-    /// Обычно `AtomicBool` внутри.
+    /// `true` ⇔ соединение закрыто. Не блокируется.
     fn is_closed(&self) -> bool;
 
-    /// Возвращает `Arc`, чтобы избежать клонирования секрета на каждый вызов.
+    /// `Arc`, чтобы не клонировать секрет на каждый вызов.
     fn private_key(&self) -> Arc<SigningKey>;
 
     /// MTU (максимальный безопасный размер сообщения).
     fn mtu(&self) -> u64;
 
     /// Отправить lookup по (возможно частичному) ключу.
-    /// Если внутри нужен await (например, `send_to`) — сделайте его `async fn`.
     fn send_lookup(&self, target: &VerifyingKey);
+}
+
+/// Async-обёртка над sync-ядром. Внутри — `spawn_blocking` + `SyncIoBridge`.
+///
+/// Требует `tokio-util = { version = "0.7", features = ["io"] }`.
+///
+/// # Errors
+/// Пробрасывает ошибку из `handle_conn_sync`.
+pub async fn handle_conn_async<P>(
+    pc: Arc<P>,
+    key: VerifyingKey,
+    conn: Box<dyn AsyncConn>,
+    prio: u8,
+) -> Result<(), Error>
+where
+    P: PacketConn + Send + Sync + 'static + ?Sized,
+{
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut bridge = tokio_util::io::SyncIoBridge::new(conn);
+        pc.handle_conn_sync(&key, &mut bridge, prio)
+    })
+    .await;
+
+    match joined {
+        Ok(res) => res,
+        // Паника в протоколе — баг, не маскируем:
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Задача отменена (не должна случаться — мы не abort'им).
+        Err(_) => Err(Error::CLOSED),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Фазз-харнесс. Не часть публичного API.
+// ────────────────────────────────────────────────────────────────────
+#[doc(hidden)]
+pub mod fuzz {
+    use super::{PacketConn, PacketConnBase, ReadWrite};
+    use crate::ironwood::errors::Error;
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Заглушка. Async-методы `PacketConnBase` возвращают `Err` —
+    /// sync-ядро не должно их звать (исходящие датаграммы идут через
+    /// внутренний sync-канал, если протокол такой использует).
+    pub struct FuzzPacketConn {
+        key: Arc<SigningKey>,
+        closed: AtomicBool,
+    }
+
+    impl FuzzPacketConn {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                key: Arc::new(SigningKey::from_bytes(&[0x42u8; 32])),
+                closed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl Default for FuzzPacketConn {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PacketConnBase for FuzzPacketConn {
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "sync path"))
+        }
+        async fn send_to(&self, _buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "sync path"))
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
+        }
+    }
+
+    impl PacketConn for FuzzPacketConn {
+        fn handle_conn_sync(
+            &self,
+            key: &VerifyingKey,
+            conn: &mut dyn ReadWrite,
+            prio: u8,
+        ) -> Result<(), Error> {
+            // >>> Подключите сюда реальный протокол: <<<
+            //     crate::ironwood::session::run_sync(self, key, conn, prio)
+            let _ = (key, conn, prio);
+            Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+        fn private_key(&self) -> Arc<SigningKey> {
+            self.key.clone()
+        }
+        fn mtu(&self) -> u64 {
+            1200
+        }
+        fn send_lookup(&self, _target: &VerifyingKey) {}
+    }
+
+    /// Ввод фаззера: `[key(32) | prio(1) | payload…]`.
+    pub fn fuzz_handle_conn(data: &[u8]) {
+        if data.len() < 33 {
+            return;
+        }
+        let key_bytes: [u8; 32] = data[..32].try_into().unwrap();
+        let prio = data[32];
+        let payload = &data[33..];
+
+        let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else {
+            return;
+        };
+
+        let pc = FuzzPacketConn::new();
+        // `Cursor<Vec<u8>>` реализует и Read, и Write.
+        let mut conn = io::Cursor::new(payload.to_vec());
+        let _ = pc.handle_conn_sync(&key, &mut conn, prio);
+    }
 }
