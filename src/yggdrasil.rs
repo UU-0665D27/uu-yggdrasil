@@ -7,12 +7,17 @@
 //!   [`Yggdrasil::peer_tcp`]);
 //! * обычные [`tokio::net::TcpStream`]/[`tokio::net::UdpSocket`] внутри
 //!   yggdrasil-сети ([`Yggdrasil::tcp`], [`Yggdrasil::udp`]);
+//! * TCP/UDP-серверы и клиенты прямо в процессе, без TUN и портов ОС
+//!   ([`Yggdrasil::tcp_listen`], [`Yggdrasil::tcp_connect`],
+//!   [`Yggdrasil::udp_bind`]);
 //! * `node_info` (JSON) и запрос `node_info` у другого узла.
 //!
-//! Для overlay-сокетов нужен TUN (`YggdrasilConfig::tun`) и права
-//! `CAP_NET_ADMIN`/root: пакеты уходят в ядро через TUN, а ключ назначения
-//! находится штатным path-lookup'ом yggdrasil. TUN по умолчанию выключен;
-//! включить его можно через [`YggdrasilConfig::with_tun`].
+//! [`Yggdrasil::tcp`] и [`Yggdrasil::udp`] используют TUN
+//! (`YggdrasilConfig::tun`) и требуют `CAP_NET_ADMIN`/root. Пользовательский
+//! стек [`Yggdrasil::tcp_listen`]/[`Yggdrasil::udp_bind`] работает без TUN:
+//! IPv6-пакеты разбираются внутри процесса, а порт существует только в
+//! yggdrasil. TUN по умолчанию выключен; включить его можно через
+//! [`YggdrasilConfig::with_tun`].
 //!
 //! ```no_run
 //! use uu_yggdrasil::{YggdrasilConfig, new};
@@ -33,6 +38,7 @@
 //! ```
 
 use crate::address::{Address, addr_for_key, addr_get_key};
+use crate::inproc::{Engine, YggTcpListener, YggTcpStream, YggUdpSocket};
 use crate::ironwood::{
     network::{Config, Ironwood, PublicKey, handshake_async, spawn_conn},
     types::{addr::KeyAddr, packetconn::PacketConnBase},
@@ -70,8 +76,10 @@ const TYPE_SESSION_PROTO: u8 = 2;
 const TYPE_NODE_INFO_REQUEST: u8 = 1;
 const TYPE_NODE_INFO_RESPONSE: u8 = 2;
 
-/// Настройки TUN. Если `YggdrasilConfig::tun == None`, overlay-сокеты
-/// недоступны, но пиры и `node_info` работают.
+/// Настройки TUN. Если `YggdrasilConfig::tun == None`, [`Yggdrasil::tcp`] и
+/// [`Yggdrasil::udp`] недоступны, но пользовательский стек
+/// ([`Yggdrasil::tcp_listen`], [`Yggdrasil::udp_bind`]), пиры и `node_info`
+/// работают.
 #[derive(Debug, Clone)]
 pub struct TunConfig {
     /// Имя интерфейса (до 15 символов).
@@ -155,14 +163,15 @@ pub async fn new(config: YggdrasilConfig) -> io::Result<Yggdrasil> {
     Yggdrasil::new(config).await
 }
 
-struct Inner {
+pub(crate) struct Inner {
     node: Arc<Ironwood>,
     secret: SigningKey,
     key: PublicKey,
     address: Address,
     node_info: NodeInfoConfig,
     tun_enabled: bool,
-    addr_to_key: RwLock<HashMap<Address, PublicKey>>,
+    addr_to_key: Arc<RwLock<HashMap<Address, PublicKey>>>,
+    inproc: Mutex<Option<Engine>>,
     pending_packets: Mutex<HashMap<Address, Vec<Vec<u8>>>>,
     last_lookup: Mutex<HashMap<Address, Instant>>,
     lookup_notify: Notify,
@@ -198,7 +207,8 @@ impl Yggdrasil {
             address,
             node_info: config.node_info,
             tun_enabled: config.tun.is_some(),
-            addr_to_key: RwLock::new(HashMap::new()),
+            addr_to_key: Arc::new(RwLock::new(HashMap::new())),
+            inproc: Mutex::new(None),
             pending_packets: Mutex::new(HashMap::new()),
             last_lookup: Mutex::new(HashMap::new()),
             lookup_notify: Notify::new(),
@@ -381,6 +391,67 @@ impl Yggdrasil {
         });
         self.inner.tasks.lock().unwrap().push(task);
         Ok(local)
+    }
+
+    /// Слушать TCP-порт внутри yggdrasil, не занимая порт ОС.
+    ///
+    /// Это пользовательский TCP/IP-стек: клиенты из yggdrasil подключаются к
+    /// этому порту обычным TCP, а приложение получает [`YggTcpStream`].
+    /// Одновременно с TUN этот режим пока не работает.
+    ///
+    /// # Errors
+    /// Порт `0`, порт уже занят внутри этого узла, включён TUN или стек не
+    /// запустился.
+    pub async fn tcp_listen(&self, port: u16) -> io::Result<YggTcpListener> {
+        if port == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TCP port must not be zero",
+            ));
+        }
+        self.inner.start_inproc()?.tcp_listen(port).await
+    }
+
+    /// Подключиться по TCP через пользовательский стек, без TUN.
+    ///
+    /// # Errors
+    /// IPv4-адрес, порт `0`, lookup или таймаут установки соединения.
+    pub async fn tcp_connect<I: Into<IpAddr>>(&self, ip: I, port: u16) -> io::Result<YggTcpStream> {
+        let ip = match ip.into() {
+            IpAddr::V6(ip) => ip,
+            IpAddr::V4(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "yggdrasil uses IPv6 addresses",
+                ));
+            }
+        };
+        if port == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TCP port must not be zero",
+            ));
+        }
+        self.inner.ensure_key(ip).await?;
+        self.inner.start_inproc()?.tcp_connect(ip, port).await
+    }
+
+    /// Слушать UDP-порт внутри yggdrasil, не занимая порт ОС.
+    ///
+    /// # Errors
+    /// Порт `0`, порт уже занят внутри этого узла, включён TUN или стек не
+    /// запустился.
+    pub async fn udp_bind(&self, port: u16) -> io::Result<YggUdpSocket> {
+        if port == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP port must not be zero",
+            ));
+        }
+        self.inner
+            .start_inproc()?
+            .udp_bind(port, Arc::clone(&self.inner))
+            .await
     }
 
     /// Открыть TCP-соединение внутри yggdrasil-сети.
@@ -594,15 +665,44 @@ impl Inner {
         }
     }
 
-    async fn ensure_key(&self, ip: Ipv6Addr) -> io::Result<PublicKey> {
+    fn start_inproc(&self) -> io::Result<Engine> {
+        if self.tun_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "in-process TCP/UDP cannot be combined with TUN yet",
+            ));
+        }
+        let mut current = self
+            .inproc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(engine) = current.as_ref() {
+            return Ok(engine.clone());
+        }
+        let (engine, tasks) = Engine::start(
+            Arc::clone(&self.node),
+            self.address,
+            Arc::clone(&self.addr_to_key),
+            self.shutdown.clone(),
+        );
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(tasks);
+        *current = Some(engine.clone());
+        drop(current);
+        Ok(engine)
+    }
+
+    pub(crate) async fn ensure_key(&self, ip: Ipv6Addr) -> io::Result<PublicKey> {
         let addr: Address = ip.octets();
-        if let Some(key) = self
+        let mapped = self
             .addr_to_key
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&addr)
-            .copied()
-        {
+            .copied();
+        if let Some(key) = mapped {
             return Ok(key);
         }
         let partial = addr_get_key(&addr);
@@ -610,13 +710,13 @@ impl Inner {
         loop {
             self.node.send_lookup_partial(&partial);
             let notified = self.lookup_notify.notified();
-            if let Some(key) = self
+            let mapped = self
                 .addr_to_key
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&addr)
-                .copied()
-            {
+                .copied();
+            if let Some(key) = mapped {
                 return Ok(key);
             }
             let retry_at = (Instant::now() + Duration::from_millis(500)).min(deadline);
@@ -943,7 +1043,8 @@ mod tests {
             address: addr_for_key(config.private_key.verifying_key().as_bytes()),
             node_info: info,
             tun_enabled: false,
-            addr_to_key: RwLock::new(HashMap::new()),
+            addr_to_key: Arc::new(RwLock::new(HashMap::new())),
+            inproc: Mutex::new(None),
             pending_packets: Mutex::new(HashMap::new()),
             last_lookup: Mutex::new(HashMap::new()),
             lookup_notify: Notify::new(),
@@ -970,7 +1071,8 @@ mod tests {
                 include_peers: false,
             },
             tun_enabled: false,
-            addr_to_key: RwLock::new(HashMap::new()),
+            addr_to_key: Arc::new(RwLock::new(HashMap::new())),
+            inproc: Mutex::new(None),
             pending_packets: Mutex::new(HashMap::new()),
             last_lookup: Mutex::new(HashMap::new()),
             lookup_notify: Notify::new(),
@@ -995,7 +1097,26 @@ mod tests {
 #[cfg(test)]
 mod live_tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::{
+        net::Ipv4Addr,
+        sync::atomic::{AtomicU16, Ordering},
+    };
+
+    fn inproc_port() -> u16 {
+        static NEXT: AtomicU16 = AtomicU16::new(21_000);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn connect_pair() -> (Yggdrasil, Yggdrasil) {
+        let a = Yggdrasil::new(YggdrasilConfig::default()).await.unwrap();
+        let b = Yggdrasil::new(YggdrasilConfig::default()).await.unwrap();
+        let addr = a
+            .listen_tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        b.peer_tcp(addr.ip(), addr.port()).await.unwrap();
+        (a, b)
+    }
 
     #[tokio::test]
     async fn direct_traffic_is_delivered_locally() {
@@ -1062,6 +1183,73 @@ mod live_tests {
             peers[0].get("key"),
             Some(&json!(hex(a.public_key().as_bytes())))
         );
+        a.close();
+        b.close();
+    }
+
+    #[tokio::test]
+    async fn inproc_tcp_echo_without_tun() {
+        let (a, b) = connect_pair().await;
+        let port = inproc_port();
+        let mut listener = a.tcp_listen(port).await.expect("tcp_listen");
+        assert_eq!(
+            listener.local_addr(),
+            SocketAddr::new(IpAddr::V6(a.address()), port)
+        );
+        let mut client = timeout(Duration::from_secs(5), b.tcp_connect(a.address(), port))
+            .await
+            .expect("connect timeout")
+            .expect("connect");
+        let (mut server, peer) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept timeout")
+            .expect("accept");
+        assert_eq!(peer, client.local_addr());
+        assert_eq!(server.peer_addr().ip(), IpAddr::V6(b.address()));
+
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(5), server.read_exact(&mut buf))
+            .await
+            .expect("read timeout")
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+
+        server.write_all(b"pong").await.unwrap();
+        timeout(Duration::from_secs(5), client.read_exact(&mut buf))
+            .await
+            .expect("read timeout")
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+        a.close();
+        b.close();
+    }
+
+    #[tokio::test]
+    async fn inproc_udp_datagrams_without_tun() {
+        let (a, b) = connect_pair().await;
+        let a_port = inproc_port();
+        let b_port = inproc_port();
+        let mut a_socket = a.udp_bind(a_port).await.expect("udp_bind a");
+        let mut b_socket = b.udp_bind(b_port).await.expect("udp_bind b");
+        let dest = SocketAddr::new(IpAddr::V6(a.address()), a_port);
+        assert_eq!(b_socket.send_to(b"hello", dest).await.unwrap(), 5);
+
+        let mut buf = [0u8; 32];
+        let (n, from) = timeout(Duration::from_secs(5), a_socket.recv_from(&mut buf))
+            .await
+            .expect("recv timeout")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(from, SocketAddr::new(IpAddr::V6(b.address()), b_port));
+
+        a_socket.send_to(b"world", from).await.unwrap();
+        let (n, from) = timeout(Duration::from_secs(5), b_socket.recv_from(&mut buf))
+            .await
+            .expect("recv timeout")
+            .unwrap();
+        assert_eq!(&buf[..n], b"world");
+        assert_eq!(from, dest);
         a.close();
         b.close();
     }

@@ -341,11 +341,23 @@ impl Ironwood {
         };
         // Прямой пир: не ждём tree/path-lookup, отправляем сразу.
         {
-            let router = self.router_lock();
-            if router.is_peer(&dest) {
+            let mut router = self.router_lock();
+            // Прямой пир: отправляем сразу, но только когда уже знаем
+            // координаты `dest` в дереве. Пустой `path` валиден лишь для
+            // корневого узла; иначе Go-совместимый router сочтёт пакет
+            // транзитным и отправит его обратно.
+            let known = router.get_root_and_dists(dest).is_some();
+            if router.is_peer(&dest) && (empty_path || known) {
+                let (_, path) = router.get_root_and_path(dest);
+                let (_, from) = router.get_root_and_path(*self.crypto.public_key());
                 let peer = router.best_peer_for(&dest);
                 drop(router);
                 if let Some(peer) = peer {
+                    let mut tr = tr;
+                    if !empty_path {
+                        tr.path = path;
+                        tr.from = from;
+                    }
                     peer.send_traffic(tr);
                     return true;
                 }
