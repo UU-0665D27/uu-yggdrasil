@@ -11,6 +11,7 @@ perf="deny"
 
 [dependencies]
 async-trait = "0.1.92"
+blake2 = "0.10.6"
 crypto_box = { version = "0.9.1", features = ["std"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"

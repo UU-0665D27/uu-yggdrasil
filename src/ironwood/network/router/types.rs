@@ -229,3 +229,99 @@ impl RouterInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn sk(b: u8) -> SigningKey {
+        SigningKey::from_bytes(&[b; 32])
+    }
+
+    fn signed_announce(port: PeerPort) -> RouterAnnounce {
+        let node = sk(1);
+        let parent = sk(2);
+        let node_pub = node.verifying_key();
+        let parent_pub = parent.verifying_key();
+
+        let req = RouterSigReq { seq: 7, nonce: 300 };
+        let base = RouterSigRes {
+            req,
+            port,
+            psig: Signature::from_bytes(&[0u8; 64]),
+        };
+        let psig = parent.sign(&base.bytes_for_sig(&node_pub, &parent_pub));
+        let res = RouterSigRes { psig, ..base };
+        let bs = res.bytes_for_sig(&node_pub, &parent_pub);
+        let sig = node.sign(&bs);
+        RouterAnnounce {
+            key: node_pub,
+            parent: parent_pub,
+            res,
+            sig,
+        }
+    }
+
+    #[test]
+    fn sig_req_roundtrip() {
+        let req = RouterSigReq {
+            seq: u64::MAX,
+            nonce: 0,
+        };
+        let mut out = Vec::new();
+        req.encode(&mut out).expect("encode");
+        assert_eq!(out.len(), WireEncodable::size(&req));
+        assert_eq!(RouterSigReq::decode(&out).expect("decode"), req);
+        assert!(RouterSigReq::decode(&out[..out.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn sig_res_roundtrip_and_check() {
+        let ann = signed_announce(5);
+        let res = ann.res;
+        let mut out = Vec::new();
+        res.encode(&mut out).expect("encode");
+        assert_eq!(out.len(), WireEncodable::size(&res));
+        assert_eq!(RouterSigRes::decode(&out).expect("decode"), res);
+        assert!(res.check(&ann.key, &ann.parent));
+        assert!(!res.check(&ann.parent, &ann.parent));
+    }
+
+    #[test]
+    fn announce_roundtrip_and_check() {
+        let ann = signed_announce(5);
+        let mut out = Vec::new();
+        ann.encode(&mut out).expect("encode");
+        assert_eq!(out.len(), WireEncodable::size(&ann));
+        let got = RouterAnnounce::decode(&out).expect("decode");
+        assert_eq!(got, ann);
+        assert!(got.check());
+
+        let info = RouterInfo {
+            parent: got.parent,
+            res: got.res,
+            sig: got.sig,
+        };
+        assert_eq!(info.get_announce(got.key), got);
+    }
+
+    #[test]
+    fn announce_rejects_non_root_port_zero() {
+        let ann = signed_announce(0);
+        // Порт 0 разрешён только когда node == parent (root).
+        assert!(!ann.check());
+    }
+
+    #[test]
+    fn announce_decode_rejects_truncated_and_trailing() {
+        let ann = signed_announce(5);
+        let mut out = Vec::new();
+        ann.encode(&mut out).expect("encode");
+        for cut in 0..out.len() {
+            assert!(RouterAnnounce::decode(&out[..cut]).is_err(), "cut={cut}");
+        }
+        out.push(0);
+        assert!(RouterAnnounce::decode(&out).is_err());
+    }
+}

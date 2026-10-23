@@ -121,3 +121,40 @@ pub fn private_key_expanded(key: &PrivateKey) -> [u8; PRIVATE_KEY_SIZE] {
     out[32..].copy_from_slice(key.verifying_key().as_bytes());
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let c = Crypto::new(&[7u8; 32]);
+        let sig = c.sign(b"this is a test");
+        assert!(c.verify(b"this is a test", &sig));
+        assert!(!c.verify(b"this is a tesT", &sig));
+    }
+
+    #[test]
+    fn public_key_helpers() {
+        let c = Crypto::new(&[1u8; 32]);
+        let a = c.public_key().to_owned();
+        let b = Crypto::new(&[2u8; 32]).public_key().to_owned();
+        assert_eq!(public_key_less(&a, &b), a.as_bytes() < b.as_bytes());
+        assert_eq!(public_key_addr(a).as_key(), &a);
+        let sig = c.sign(b"msg");
+        assert!(public_key_verify(&a, b"msg", &sig));
+        assert!(!public_key_verify(&a, b"other", &sig));
+    }
+
+    #[test]
+    fn private_key_expanded_is_go_layout() {
+        let c = Crypto::new(&[0x42u8; 32]);
+        let full = private_key_expanded(c.private_key());
+        assert_eq!(&full[..32], &[0x42u8; 32]);
+        assert_eq!(&full[32..], c.public_key().as_bytes());
+        assert!(private_key_equal(
+            c.private_key(),
+            &SigningKey::from_bytes(&[0x42u8; 32])
+        ));
+    }
+}

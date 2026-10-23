@@ -358,8 +358,11 @@ pub fn spawn_peer(
             let mut wh = write_half;
             loop {
                 while let Some(frame) = peer_w.try_pop() {
-                    let Ok(bytes) = encode_frame(&frame) else {
-                        continue;
+                    let bytes = match encode_frame(&frame) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            continue;
+                        }
                     };
                     if wh.write_all(&bytes).await.is_err() {
                         shutdown_w.cancel();

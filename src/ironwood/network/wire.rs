@@ -189,3 +189,96 @@ pub fn wire_encode(
     out.push(ptype as u8);
     obj.encode(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enc(u: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        wire_append_uint(&mut v, u);
+        v
+    }
+
+    #[test]
+    fn uvarint_golden() {
+        assert_eq!(enc(0), [0]);
+        assert_eq!(enc(1), [1]);
+        assert_eq!(enc(127), [0x7f]);
+        assert_eq!(enc(128), [0x80, 0x01]);
+        assert_eq!(enc(300), [0xac, 0x02]);
+        assert_eq!(
+            enc(u64::MAX),
+            [0xff; 9].iter().copied().chain([0x01]).collect::<Vec<_>>()
+        );
+        assert_eq!(wire_size_uint(u64::MAX), 10);
+    }
+
+    #[test]
+    fn uvarint_roundtrip() {
+        for u in [
+            0,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16383,
+            16384,
+            1 << 32,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let v = enc(u);
+            assert_eq!(v.len(), wire_size_uint(u));
+            let mut s = v.as_slice();
+            assert_eq!(wire_chop_uint(&mut s), Some(u));
+            assert!(s.is_empty());
+        }
+    }
+
+    #[test]
+    fn uvarint_rejects_truncated_and_overflow() {
+        let mut s: &[u8] = &[0x80];
+        assert_eq!(wire_chop_uint(&mut s), None);
+        let mut s: &[u8] = &[0xff; 10];
+        assert_eq!(wire_chop_uint(&mut s), None);
+        let mut s: &[u8] = &[0xff; 9].iter().copied().chain([0x02]).collect::<Vec<_>>();
+        assert_eq!(wire_chop_uint(&mut s), None);
+    }
+
+    #[test]
+    fn path_roundtrip() {
+        for path in [vec![], vec![1], vec![1, 300, u64::MAX]] {
+            let mut out = Vec::new();
+            wire_append_path(&mut out, &path);
+            assert_eq!(out.len(), wire_size_path(&path));
+            assert_eq!(wire_decode_path(&out), Some((path.clone(), out.len())));
+
+            let mut rest = out.as_slice();
+            let mut got = Vec::new();
+            assert!(wire_chop_path(&mut got, &mut rest));
+            assert_eq!(got, path);
+            assert!(rest.is_empty());
+        }
+    }
+
+    #[test]
+    fn path_stops_at_first_zero() {
+        // 1, 0, 2: путь = [1], после терминатора остаётся 0x02.
+        let data = [1u8, 0, 2];
+        assert_eq!(wire_decode_path(&data), Some((vec![1], 2)));
+        // Нет терминатора.
+        assert_eq!(wire_decode_path(&[1, 2]), None);
+    }
+
+    #[test]
+    fn packet_type_byte() {
+        for b in 0u8..=9 {
+            let t = WirePacketType::try_from_byte(b).expect("valid");
+            assert_eq!(u8::from(t), b);
+        }
+        assert!(WirePacketType::try_from_byte(10).is_err());
+        assert!(WirePacketType::try_from_byte(255).is_err());
+    }
+}

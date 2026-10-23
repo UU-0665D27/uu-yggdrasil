@@ -43,3 +43,31 @@ impl Addr for KeyAddr {
         Self::NETWORK
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn display_is_lowercase_hex() {
+        let k = SigningKey::from_bytes(&[0xabu8; 32]).verifying_key();
+        let a = KeyAddr::new(k);
+        let expected = k.as_bytes().iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        assert_eq!(a.to_string(), expected);
+        assert_eq!(a.to_string().len(), 64);
+        assert_eq!(a.as_bytes(), k.as_bytes());
+        assert_eq!(a.as_key(), &k);
+    }
+
+    #[test]
+    fn network_name_matches_go() {
+        let k = SigningKey::from_bytes(&[0u8; 32]).verifying_key();
+        assert_eq!(KeyAddr::new(k).network(), "ed25519.PublicKey");
+        assert_eq!(format!("{:?}", KeyAddr::new(k)), format!("KeyAddr({k:?})"));
+    }
+}

@@ -123,3 +123,93 @@ impl Traffic {
         WirePacketType::Traffic
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn key(b: u8) -> PublicKey {
+        SigningKey::from_bytes(&[b; 32]).verifying_key()
+    }
+
+    fn sample() -> Traffic {
+        Traffic {
+            path: vec![1, 300, u64::MAX],
+            from: vec![7],
+            source: key(1),
+            dest: key(2),
+            watermark: u64::MAX,
+            payload: b"hello".to_vec(),
+        }
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let tr = sample();
+        let mut out = Vec::new();
+        tr.encode(&mut out).expect("encode");
+        assert_eq!(out.len(), WireEncodable::size(&tr));
+        let got = Traffic::decode(&out).expect("decode");
+        assert_eq!(got.path, tr.path);
+        assert_eq!(got.from, tr.from);
+        assert_eq!(got.source, tr.source);
+        assert_eq!(got.dest, tr.dest);
+        assert_eq!(got.watermark, tr.watermark);
+        assert_eq!(got.payload, tr.payload);
+    }
+
+    #[test]
+    fn empty_payload_and_paths() {
+        let tr = Traffic {
+            path: vec![],
+            from: vec![],
+            source: key(3),
+            dest: key(4),
+            watermark: 0,
+            payload: vec![],
+        };
+        let mut out = Vec::new();
+        tr.encode(&mut out).expect("encode");
+        let got = Traffic::decode(&out).expect("decode");
+        assert!(got.payload.is_empty());
+        assert!(got.path.is_empty());
+        assert!(got.from.is_empty());
+    }
+
+    #[test]
+    fn header_size_matches_empty() {
+        let tr = Traffic {
+            path: vec![],
+            from: vec![],
+            source: key(0),
+            dest: key(0),
+            watermark: u64::MAX,
+            payload: vec![],
+        };
+        assert_eq!(Traffic::header_size(), WireEncodable::size(&tr) as u64 + 1);
+    }
+
+    #[test]
+    fn decode_rejects_truncated() {
+        let tr = sample();
+        let mut out = Vec::new();
+        tr.encode(&mut out).expect("encode");
+        for cut in 0..(out.len() - tr.payload.len()) {
+            assert!(Traffic::decode(&out[..cut]).is_err(), "cut={cut}");
+        }
+        // Обрезанный payload — это уже просто более короткий payload.
+        let got = Traffic::decode(&out[..out.len() - 1]).expect("header intact");
+        assert_eq!(got.payload, b"hell");
+    }
+
+    #[test]
+    fn decode_keeps_trailing_bytes_as_payload() {
+        let tr = sample();
+        let mut out = Vec::new();
+        tr.encode(&mut out).expect("encode");
+        out.extend_from_slice(&[0xde, 0xad]);
+        let got = Traffic::decode(&out).expect("decode");
+        assert_eq!(got.payload, b"hello\xde\xad");
+    }
+}

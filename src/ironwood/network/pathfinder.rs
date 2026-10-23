@@ -672,3 +672,100 @@ impl Pathfinder {
             .retain(|_, rumor| now.duration_since(rumor.last_seen) < timeout);
     }
 }
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn sk(b: u8) -> SigningKey {
+        SigningKey::from_bytes(&[b; 32])
+    }
+
+    fn encode<T: WireEncodable>(v: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        v.encode(&mut out).expect("encode");
+        assert_eq!(out.len(), WireEncodable::size(v));
+        out
+    }
+
+    #[test]
+    fn lookup_roundtrip() {
+        let l = PathLookup {
+            source: sk(1).verifying_key(),
+            dest: sk(2).verifying_key(),
+            from: vec![1, 300, u64::MAX],
+        };
+        let out = encode(&l);
+        assert_eq!(PathLookup::decode(&out).expect("decode"), l);
+        for cut in 0..out.len() {
+            assert!(PathLookup::decode(&out[..cut]).is_err(), "cut={cut}");
+        }
+    }
+
+    #[test]
+    fn notify_info_roundtrip_and_sign() {
+        let key = sk(3);
+        let mut info = PathNotifyInfo {
+            seq: 42,
+            path: vec![1, 2, 3],
+            sig: Signature::from_bytes(&[0u8; 64]),
+        };
+        info.sign(&key);
+        assert!(public_key_verify(
+            &key.verifying_key(),
+            &info.bytes_for_sig(),
+            &info.sig
+        ));
+
+        let out = encode(&info);
+        assert_eq!(PathNotifyInfo::decode(&out).expect("decode"), info);
+        for cut in 0..out.len() {
+            assert!(PathNotifyInfo::decode(&out[..cut]).is_err(), "cut={cut}");
+        }
+    }
+
+    #[test]
+    fn notify_roundtrip_and_check() {
+        let key = sk(4);
+        let mut info = PathNotifyInfo {
+            seq: 9,
+            path: vec![7],
+            sig: Signature::from_bytes(&[0u8; 64]),
+        };
+        info.sign(&key);
+        let n = PathNotify {
+            path: vec![1, 2],
+            watermark: u64::MAX,
+            source: key.verifying_key(),
+            dest: sk(5).verifying_key(),
+            info,
+        };
+        assert!(n.check());
+        let mut bad = n.clone();
+        bad.info.seq += 1;
+        assert!(!bad.check());
+
+        let out = encode(&n);
+        let got = PathNotify::decode(&out).expect("decode");
+        assert_eq!(got, n);
+        for cut in 0..out.len() {
+            assert!(PathNotify::decode(&out[..cut]).is_err(), "cut={cut}");
+        }
+    }
+
+    #[test]
+    fn broken_roundtrip() {
+        let b = PathBroken {
+            path: vec![1, 2, 3],
+            watermark: 5,
+            source: sk(6).verifying_key(),
+            dest: sk(7).verifying_key(),
+        };
+        let out = encode(&b);
+        assert_eq!(PathBroken::decode(&out).expect("decode"), b);
+        for cut in 0..out.len() {
+            assert!(PathBroken::decode(&out[..cut]).is_err(), "cut={cut}");
+        }
+    }
+}

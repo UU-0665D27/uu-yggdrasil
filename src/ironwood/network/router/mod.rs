@@ -17,7 +17,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 pub use types::{RouterAnnounce, RouterInfo, RouterSigReq, RouterSigRes};
 
@@ -95,6 +95,10 @@ pub struct Router {
 
     blooms: Blooms,
     refresh: bool,
+    do_root1: bool,
+    do_root2: bool,
+    self_refresh_at: Instant,
+    info_seen: HashMap<PublicKey, Instant>,
 }
 
 impl Router {
@@ -113,6 +117,10 @@ impl Router {
             sent: HashMap::new(),
             blooms: Blooms::new(),
             refresh: false,
+            do_root1: false,
+            do_root2: false,
+            self_refresh_at: Instant::now(),
+            info_seen: HashMap::new(),
         }
     }
 
@@ -125,6 +133,12 @@ impl Router {
         &self.blooms
     }
 
+    /// Есть ли прямой пир с ключом `key`.
+    #[must_use]
+    pub fn is_peer(&self, key: &PublicKey) -> bool {
+        self.peers.contains_key(key)
+    }
+
     #[must_use]
     pub fn best_peer_for(&self, key: &PublicKey) -> Option<Arc<dyn PeerHandle>> {
         self.peers
@@ -133,11 +147,204 @@ impl Router {
             .map(|e| Arc::clone(&e.handle))
     }
 
-    /// Периодическое обслуживание. В Go это `_doMaintenance`; у нас пока
-    /// только Bloom'ы — `_fix`/`_sendAnnounces` придут со следующим этапом.
+    /// Периодическое обслуживание (Go `_doMaintenance`): сброс кэша,
+    /// истечение чужих `infos`, выбор родителя, рассылка announce, Bloom'ы.
     pub fn do_maintenance(&mut self) {
+        self.cache.clear();
+        self.expire_infos();
+        if Instant::now() >= self.self_refresh_at {
+            self.refresh = true;
+            self.self_refresh_at = Instant::now() + self.config.router_refresh;
+        }
+        self.fix();
+        self.send_announces();
         self.fix_blooms_on_tree();
         self.send_all_blooms();
+    }
+
+    fn expire_infos(&mut self) {
+        let self_key = *self.crypto.public_key();
+        let timeout = self.config.router_timeout;
+        let now = Instant::now();
+        let expired: Vec<PublicKey> = self
+            .info_seen
+            .iter()
+            .filter(|(k, seen)| **k != self_key && now.duration_since(**seen) >= timeout)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in expired {
+            self.infos.remove(&key);
+            self.info_seen.remove(&key);
+            for sent in self.sent.values_mut() {
+                sent.remove(&key);
+            }
+        }
+    }
+
+    fn peer_cost(&self, handle: &Arc<dyn PeerHandle>) -> u64 {
+        let ms = self
+            .lags
+            .get(&arc_identity(handle))
+            .map_or(0, |d| d.as_millis() as u64);
+        ms.max(1)
+    }
+
+    /// Go `_fix`: выбрать лучшего родителя/корень.
+    fn fix(&mut self) {
+        let self_key = *self.crypto.public_key();
+        let Some(self_info) = self.infos.get(&self_key).cloned() else {
+            return;
+        };
+
+        let mut best_root = self_key;
+        let mut best_parent = self_key;
+        let mut best_cost = u64::MAX;
+
+        if self.peers.contains_key(&self_info.parent)
+            && let Some((root, dists)) = self.get_root_and_dists(self_key)
+            && public_key_less(&root, &best_root)
+        {
+            let mut cost = u64::MAX;
+            if let Some(peers) = self.peers.get(&self_info.parent) {
+                for p in peers {
+                    let c = dists
+                        .get(&root)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_mul(self.peer_cost(&p.handle));
+                    cost = cost.min(c);
+                }
+            }
+            best_root = root;
+            best_parent = self_info.parent;
+            best_cost = cost;
+        }
+
+        let response_keys: Vec<PublicKey> = self.responses.keys().copied().collect();
+        for pk in response_keys {
+            if !self.infos.contains_key(&pk) {
+                continue;
+            }
+            let Some((p_root, p_dists)) = self.get_root_and_dists(pk) else {
+                continue;
+            };
+            if p_dists.contains_key(&self_key) {
+                continue;
+            }
+            let mut cost = u64::MAX;
+            if let Some(peers) = self.peers.get(&pk) {
+                for p in peers {
+                    let c = p_dists
+                        .get(&p_root)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                        .saturating_mul(self.peer_cost(&p.handle));
+                    cost = cost.min(c);
+                }
+            }
+
+            if public_key_less(&p_root, &best_root) {
+                best_root = p_root;
+                best_parent = pk;
+                best_cost = cost;
+            } else if p_root != best_root {
+                continue;
+            }
+            let refresh_better = self.refresh && cost.saturating_mul(2) < best_cost;
+            let parent_better = best_parent != self_info.parent && cost < best_cost;
+            if refresh_better || parent_better {
+                best_root = p_root;
+                best_parent = pk;
+                best_cost = cost;
+            }
+        }
+
+        if self.refresh || self.do_root1 || self.do_root2 || self_info.parent != best_parent {
+            let res = self.responses.get(&best_parent).copied();
+            if let Some(res) = res
+                && best_root != self_key
+                && self.use_response(best_parent, &res)
+            {
+                self.refresh = false;
+                self.do_root1 = false;
+                self.do_root2 = false;
+                self.send_reqs();
+            } else if self.do_root2 {
+                self.become_root();
+                self.refresh = false;
+                self.do_root1 = false;
+                self.do_root2 = false;
+                self.send_reqs();
+            } else if !self.do_root1 {
+                self.do_root1 = true;
+            }
+        }
+    }
+
+    fn use_response(&mut self, peer_key: PublicKey, res: &RouterSigRes) -> bool {
+        let self_key = *self.crypto.public_key();
+        let sig = self
+            .crypto
+            .private_key()
+            .sign(&res.bytes_for_sig(&self_key, &peer_key));
+        let info = RouterInfo {
+            parent: peer_key,
+            res: *res,
+            sig,
+        };
+        let ann = info.get_announce(self_key);
+        self.update(&ann)
+    }
+
+    fn send_reqs(&mut self) {
+        self.requests.clear();
+        self.responses.clear();
+        let keys: Vec<PublicKey> = self.peers.keys().copied().collect();
+        for key in keys {
+            let req = self.new_req();
+            self.requests.insert(key, req);
+            let peers: Vec<Arc<dyn PeerHandle>> = self
+                .peers
+                .get(&key)
+                .map_or_default(|v| v.iter().map(|e| Arc::clone(&e.handle)).collect());
+            for p in peers {
+                self.responded.remove(&arc_identity(&p));
+                p.send_sig_req(&req);
+            }
+        }
+    }
+
+    fn send_announces(&mut self) {
+        let self_key = *self.crypto.public_key();
+        let self_anc = self.get_ancestry(self_key);
+        let peer_keys: Vec<PublicKey> = self.sent.keys().copied().collect();
+        for peer_key in peer_keys {
+            let peer_anc = self.get_ancestry(peer_key);
+            let mut to_send = Vec::new();
+            for k in self_anc.iter().chain(peer_anc.iter()) {
+                if let Some(sent) = self.sent.get_mut(&peer_key)
+                    && sent.insert(*k)
+                {
+                    to_send.push(*k);
+                }
+            }
+            let mut anns = Vec::new();
+            for k in to_send {
+                if let Some(info) = self.infos.get(&k) {
+                    anns.push(info.get_announce(k));
+                }
+            }
+            let peers: Vec<Arc<dyn PeerHandle>> = self
+                .peers
+                .get(&peer_key)
+                .map_or_default(|v| v.iter().map(|e| Arc::clone(&e.handle)).collect());
+            for p in peers {
+                for ann in &anns {
+                    p.send_announce(ann);
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -230,9 +437,9 @@ impl Router {
         };
         let is_self = ann.key == *self.crypto.public_key();
         self.infos.insert(ann.key, info);
-
+        self.info_seen.insert(ann.key, Instant::now());
         if is_self {
-            self.refresh = true;
+            self.self_refresh_at = Instant::now() + self.config.router_refresh;
         }
         true
     }

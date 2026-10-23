@@ -1,8 +1,8 @@
 //! Bloom-фильтр ironwood: 8192 бита, 8 хешей, wire-формат Go-совместим
 //! (плотная упаковка с флагами нулевых/единичных чанков).
 //!
-//! Хеш — FNV-1 (Go `fnv.New64()`), страйд-техника Кирша–Мицценмахера
-//! `h_i = h1 + i*h2` — как в `bits-and-blooms/bloom` v3.
+//! Хеширование побайтово совместимо с `bits-and-blooms/bloom` v3:
+//! murmur3 x64_128 (`sum256` → 4 u64) и функция `location` из библиотеки.
 
 use crate::ironwood::{
     errors::Error,
@@ -22,17 +22,135 @@ pub const BLOOM_FILTER_M: usize = BLOOM_FILTER_U * 64;
 /// Кол-во хешей.
 pub const BLOOM_FILTER_K: u64 = 8;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const C1_128: u64 = 0x87c3_7b91_1142_53d5;
+const C2_128: u64 = 0x4cf5_ad43_2745_937f;
 
-/// FNV-1 64-bit (Go `fnv.New64()`, не `New64a`).
-fn fnv1_64(data: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in data {
-        h = h.wrapping_mul(FNV_PRIME);
-        h ^= u64::from(b);
+/// murmur3 x64_128, `digest128` из `bits-and-blooms/bloom` v3.
+struct Digest128 {
+    h1: u64,
+    h2: u64,
+}
+
+impl Digest128 {
+    fn new() -> Self {
+        Self { h1: 0, h2: 0 }
     }
-    h
+
+    fn bmix_words(&mut self, k1: u64, k2: u64) {
+        let mut k1 = k1.wrapping_mul(C1_128);
+        k1 = k1.rotate_left(31);
+        k1 = k1.wrapping_mul(C2_128);
+        self.h1 ^= k1;
+
+        self.h1 = self.h1.rotate_left(27);
+        self.h1 = self.h1.wrapping_add(self.h2);
+        self.h1 = self.h1.wrapping_mul(5).wrapping_add(0x52dc_e729);
+
+        let mut k2 = k2.wrapping_mul(C2_128);
+        k2 = k2.rotate_left(33);
+        k2 = k2.wrapping_mul(C1_128);
+        self.h2 ^= k2;
+
+        self.h2 = self.h2.rotate_left(31);
+        self.h2 = self.h2.wrapping_add(self.h1);
+        self.h2 = self.h2.wrapping_mul(5).wrapping_add(0x3849_5ab5);
+    }
+
+    fn bmix(&mut self, data: &[u8]) {
+        for block in data.chunks_exact(16) {
+            let k1 = u64::from_le_bytes(block[..8].try_into().unwrap_or([0; 8]));
+            let k2 = u64::from_le_bytes(block[8..].try_into().unwrap_or([0; 8]));
+            self.bmix_words(k1, k2);
+        }
+    }
+
+    /// `sum128` для хвоста длиной `< 16` (без «виртуального» байта).
+    fn sum128(&self, length: u64, tail: &[u8]) -> (u64, u64) {
+        let mut k1 = 0u64;
+        let mut k2 = 0u64;
+        for (i, &b) in tail.iter().enumerate().take(8) {
+            k1 |= u64::from(b) << (8 * i);
+        }
+        for (i, &b) in tail.iter().enumerate().skip(8) {
+            k2 |= u64::from(b) << (8 * (i - 8));
+        }
+
+        let mut h1 = self.h1;
+        let mut h2 = self.h2;
+        if tail.len() >= 9 {
+            let mut k2 = k2.wrapping_mul(C2_128);
+            k2 = k2.rotate_left(33);
+            k2 = k2.wrapping_mul(C1_128);
+            h2 ^= k2;
+        }
+        if !tail.is_empty() {
+            let mut k1 = k1.wrapping_mul(C1_128);
+            k1 = k1.rotate_left(31);
+            k1 = k1.wrapping_mul(C2_128);
+            h1 ^= k1;
+        }
+
+        h1 ^= length;
+        h2 ^= length;
+        h1 = h1.wrapping_add(h2);
+        h2 = h2.wrapping_add(h1);
+        h1 = fmix64(h1);
+        h2 = fmix64(h2);
+        h1 = h1.wrapping_add(h2);
+        h2 = h2.wrapping_add(h1);
+        (h1, h2)
+    }
+
+    /// `sum256`: четыре 64-битных хеша.
+    fn sum256(&mut self, data: &[u8]) -> [u64; 4] {
+        self.h1 = 0;
+        self.h2 = 0;
+        self.bmix(data);
+
+        let length = data.len() as u64;
+        let tail_len = data.len() % 16;
+        let tail = &data[data.len() - tail_len..];
+        let (hash1, hash2) = self.sum128(length, tail);
+
+        let (hash3, hash4) = if tail_len + 1 == 16 {
+            let word1 = u64::from_le_bytes(tail[..8].try_into().unwrap_or([0; 8]));
+            let mut word2 = u64::from_le_bytes([
+                tail[8], tail[9], tail[10], tail[11], tail[12], tail[13], tail[14], 0,
+            ]);
+            word2 |= 1u64 << 56;
+            self.bmix_words(word1, word2);
+            self.sum128(length + 1, &[])
+        } else {
+            let mut padded = [0u8; 16];
+            padded[..tail_len].copy_from_slice(tail);
+            padded[tail_len] = 1;
+            self.sum128(length + 1, &padded[..=tail_len])
+        };
+        [hash1, hash2, hash3, hash4]
+    }
+}
+
+fn fmix64(k: u64) -> u64 {
+    let mut k = k;
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    k ^= k >> 33;
+    k
+}
+
+/// `location(h, i)` из `bits-and-blooms/bloom`.
+fn location(h: [u64; 4], i: u64) -> u64 {
+    let idx = (i + (i % 2)) % 4;
+    h[usize::try_from(i % 2).unwrap_or(0)]
+        .wrapping_add(i.wrapping_mul(h[usize::try_from(2 + idx / 2).unwrap_or(0)]))
+}
+
+fn hash_locations(data: &[u8]) -> impl Iterator<Item = usize> {
+    let h = Digest128::new().sum256(data);
+    (0..BLOOM_FILTER_K)
+        .map(move |i| usize::try_from(location(h, i) % BLOOM_FILTER_M as u64).unwrap_or(0))
 }
 
 /// `bloom` — 8192-битный фильтр.
@@ -56,13 +174,7 @@ impl Bloom {
 
     /// Добавить произвольные байты — используется и для `xKey` трансформаций.
     pub fn add_bytes(&mut self, data: &[u8]) {
-        let h = fnv1_64(data);
-        let b = h.to_le_bytes();
-        let h1 = u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        let h2 = u64::from(u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
-        for i in 0..BLOOM_FILTER_K {
-            let combined = h1.wrapping_add(i.wrapping_mul(h2));
-            let bit = usize::try_from(combined % BLOOM_FILTER_M as u64).unwrap_or(0);
+        for bit in hash_locations(data) {
             self.bits[bit / 64] |= 1u64 << (bit % 64);
         }
     }
@@ -77,13 +189,7 @@ impl Bloom {
     /// Возможно, `data` в фильтре (`true` = возможно, `false` = точно нет).
     #[must_use]
     pub fn test(&self, data: &[u8]) -> bool {
-        let h = fnv1_64(data);
-        let b = h.to_le_bytes();
-        let h1 = u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        let h2 = u64::from(u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
-        for i in 0..BLOOM_FILTER_K {
-            let combined = h1.wrapping_add(i.wrapping_mul(h2));
-            let bit = usize::try_from(combined % BLOOM_FILTER_M as u64).unwrap_or(0);
+        for bit in hash_locations(data) {
             if self.bits[bit / 64] & (1u64 << (bit % 64)) == 0 {
                 return false;
             }
@@ -231,5 +337,195 @@ impl Blooms {
 
     pub(crate) fn get_mut(&mut self, key: &PublicKey) -> Option<&mut BloomInfo> {
         self.inner.get_mut(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let b = s.as_bytes();
+        for pair in b.chunks_exact(2) {
+            let hi = (pair[0] as char).to_digit(16).expect("hex");
+            let lo = (pair[1] as char).to_digit(16).expect("hex");
+            out.push(u8::try_from(hi * 16 + lo).expect("byte"));
+        }
+        out
+    }
+
+    fn hex(v: &[u8]) -> String {
+        use std::fmt::Write as _;
+        v.iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
+    // Golden values получены из Go: bits-and-blooms/bloom v3.7.1.
+    const EMPTY: &str = "ffffffffffffffffffffffffffffffff00000000000000000000000000000000";
+    const ADD_01: &str = "ffffffffffffeffeffffffebfffffa3f0000000000000000000000000000000000000000000000400000000000000004000004000000000000000040000000000000000010000000000000000100000000000000004000000004000000000000";
+
+    #[test]
+    fn empty_encode_matches_go() {
+        let mut out = Vec::new();
+        Bloom::new().encode(&mut out).expect("encode");
+        assert_eq!(hex(&out), EMPTY);
+        assert_eq!(out.len(), Bloom::new().size());
+    }
+
+    #[test]
+    fn add_encode_matches_go() {
+        let mut b = Bloom::new();
+        b.add_bytes(&[1]);
+        let mut out = Vec::new();
+        b.encode(&mut out).expect("encode");
+        assert_eq!(hex(&out), ADD_01);
+        assert_eq!(out.len(), b.size());
+        assert!(b.test(&[1]));
+        assert!(!b.test(&[2]));
+        assert!(!b.test(b"hello"));
+    }
+
+    #[test]
+    fn decode_roundtrip() {
+        let mut b = Bloom::new();
+        b.add_bytes(&[1]);
+        b.add_bytes(&[0, 0, 0, 0]);
+        b.add_bytes(b"hello");
+        let mut out = Vec::new();
+        b.encode(&mut out).expect("encode");
+        let d = Bloom::decode(&out).expect("decode");
+        assert_eq!(b, d);
+        assert_eq!(d.size(), b.size());
+    }
+
+    #[test]
+    fn merge_ors_bits() {
+        let mut a = Bloom::new();
+        a.add_bytes(&[1]);
+        let mut b = Bloom::new();
+        b.add_bytes(&[2]);
+        let mut both = a.clone();
+        both.merge(&b);
+        assert!(both.test(&[1]));
+        assert!(both.test(&[2]));
+        assert!(!a.test(&[2]));
+    }
+
+    #[test]
+    fn decode_rejects_bad_input() {
+        assert!(Bloom::decode(&[]).is_err());
+        assert!(Bloom::decode(&[0u8; 31]).is_err());
+        assert!(Bloom::decode(&[0u8; 33]).is_err());
+
+        // Один и тот же чанк помечен и как нулевой, и как all-ones.
+        let mut bad = unhex(EMPTY);
+        bad[0] = 0x80;
+        bad[16] = 0x80;
+        assert_eq!(bad[0] & bad[16], 0x80);
+        assert!(Bloom::decode(&bad).is_err());
+
+        // Не хватает упакованного чанка.
+        let short = &unhex(ADD_01)[..39];
+        assert!(Bloom::decode(short).is_err());
+
+        // Лишние байты в конце.
+        let mut long = unhex(EMPTY);
+        long.push(0);
+        assert!(Bloom::decode(&long).is_err());
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    fn words(b: &Bloom) -> Vec<(usize, u64)> {
+        b.bits
+            .iter()
+            .enumerate()
+            .filter(|&(_, &w)| w != 0)
+            .map(|(i, &w)| (i, w))
+            .collect()
+    }
+
+    // Golden из Go bits-and-blooms v3.7.1 (проверяет murmur-tail и bmix).
+    #[test]
+    fn murmur_locations_match_go() {
+        let pattern: Vec<u8> = (0..100u8).collect();
+        let cases: [(&[u8], &[(usize, u64)]); 5] = [
+            (
+                &[0x11; 15],
+                &[
+                    (49, 2097152),
+                    (64, 8388608),
+                    (73, 67108864),
+                    (82, 16384),
+                    (99, 524288),
+                    (107, 536870912),
+                    (108, 128),
+                    (122, 2147483648),
+                ],
+            ),
+            (
+                &[0x22; 16],
+                &[
+                    (1, 4398046511104),
+                    (19, 1073741824),
+                    (25, 576460752303423488),
+                    (28, 16384),
+                    (43, 140737488355328),
+                    (57, 18014398509481984),
+                    (81, 4194304),
+                    (110, 4611686018427387904),
+                ],
+            ),
+            (
+                &[0x33; 17],
+                &[
+                    (9, 281474976710656),
+                    (25, 281474976710656),
+                    (30, 1125899906842624),
+                    (42, 17592186044416),
+                    (58, 17592186044416),
+                    (72, 18014398509481984),
+                    (73, 8192),
+                    (115, 131072),
+                ],
+            ),
+            (
+                &[0x42; 32],
+                &[
+                    (6, 140737488355328),
+                    (8, 72057594037927936),
+                    (47, 2),
+                    (58, 4503599627370496),
+                    (67, 1152921504606846976),
+                    (72, 8192),
+                    (84, 2251799813685248),
+                    (93, 256),
+                ],
+            ),
+            (
+                &pattern,
+                &[
+                    (12, 4),
+                    (16, 288230376151711744),
+                    (24, 64),
+                    (36, 67108864),
+                    (59, 64),
+                    (67, 131072),
+                    (71, 1024),
+                    (86, 562949953421312),
+                ],
+            ),
+        ];
+        for (data, expected) in cases {
+            let mut b = Bloom::new();
+            b.add_bytes(data);
+            assert_eq!(words(&b), expected, "data len {}", data.len());
+        }
     }
 }

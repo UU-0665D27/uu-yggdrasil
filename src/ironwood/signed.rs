@@ -174,3 +174,59 @@ pub mod fuzz {
         let _ = spc.unpack_len(bs, &from_key);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ironwood::types::packetconn::fuzz::FuzzPacketConn;
+
+    fn conn(seed: u8) -> SignedPacketConn<FuzzPacketConn> {
+        SignedPacketConn::new(
+            Arc::new(FuzzPacketConn::new()),
+            SigningKey::from_bytes(&[seed; 32]),
+        )
+    }
+
+    #[test]
+    fn sign_unpack_roundtrip() {
+        let alice = conn(1);
+        let bob = conn(2);
+        let msg = b"payload";
+        let wire = alice.sign(&bob.public, msg);
+
+        assert_eq!(wire.len(), SIG_LEN + msg.len());
+        assert_eq!(bob.unpack_len(&wire, &alice.public), Some(msg.len()));
+    }
+
+    #[test]
+    fn unpack_rejects_wrong_sender() {
+        let alice = conn(1);
+        let bob = conn(2);
+        let eve = conn(3);
+        let wire = alice.sign(&bob.public, b"x");
+        assert_eq!(bob.unpack_len(&wire, &eve.public), None);
+    }
+
+    #[test]
+    fn unpack_rejects_tampered_or_short() {
+        let alice = conn(1);
+        let bob = conn(2);
+        let wire = alice.sign(&bob.public, b"x");
+        assert_eq!(bob.unpack_len(&wire[..SIG_LEN - 1], &alice.public), None);
+
+        let mut bad = wire.clone();
+        *bad.last_mut().expect("nonempty") ^= 1;
+        assert_eq!(bob.unpack_len(&bad, &alice.public), None);
+
+        let mut bad = wire;
+        bad[0] ^= 1;
+        assert_eq!(bob.unpack_len(&bad, &alice.public), None);
+    }
+
+    #[test]
+    fn mtu_subtracts_signature() {
+        let c = conn(1);
+        // FuzzPacketConn может иметь любой mtu; проверяем saturating-логику.
+        assert_eq!(c.mtu(), c.inner.mtu().saturating_sub(SIG_LEN as u64));
+    }
+}

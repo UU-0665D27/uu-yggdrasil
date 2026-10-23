@@ -777,11 +777,6 @@ impl SessionManager {
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
-    /// Количество ожидающих буферов.
-    #[must_use]
-    pub fn buffer_count(&self) -> usize {
-        self.buffers.len()
-    }
 }
 
 /// `_ = Error` — на будущее (например, `Error::ENCODE` при создании
@@ -794,8 +789,8 @@ mod tests {
         crypto::{EdPriv, GroupAuth, ed25519_priv_to_curve25519, new_box_keys},
         session::{
             RecvResult, SESSION_ACK_SIZE, SESSION_INIT_SIZE, SESSION_TIMEOUT, SESSION_TYPE_ACK,
-            SESSION_TYPE_INIT, SessionAck, SessionBuffer, SessionEvent, SessionInfo, SessionInit,
-            SessionManager,
+            SESSION_TYPE_INIT, SESSION_TYPE_TRAFFIC, SessionAck, SessionBuffer, SessionEvent,
+            SessionInfo, SessionInit, SessionManager,
         },
     };
 
@@ -936,10 +931,13 @@ mod tests {
         // Alice получает ack → создаёт сессию + отправляет отложенный hello.
         let events = alice.handle_data(bob_pub, &ack_wire, now);
         assert_eq!(alice.session_count(), 1);
-        // Один из событий должен быть отправкой traffic'а (не ack).
+        // Alice отвечает ack'ом на ack (self-heal, как в Go) и затем шлёт
+        // отложенный traffic. Нас интересует именно traffic.
         let traffic_send = events
             .iter()
-            .find(|e| matches!(e, SessionEvent::Send { .. }))
+            .find(
+                |e| matches!(e, SessionEvent::Send { data, .. } if data[0] == SESSION_TYPE_TRAFFIC),
+            )
             .expect("alice should send traffic");
         let SessionEvent::Send {
             data: traffic_wire, ..

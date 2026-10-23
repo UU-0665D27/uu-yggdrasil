@@ -12,12 +12,16 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::ironwood::encrypted::{
+    crypto::GroupAuth,
+    session::{SessionEvent, SessionManager},
+};
 use crate::ironwood::network::pathfinder::Pathfinder;
 use crate::ironwood::{
     errors::Error,
     network::{
         config::Config,
-        crypto::Crypto,
+        crypto::{Crypto, PublicKey},
         deadline::Deadline,
         peer::{InFrame, PacketDispatcher, Peer, PeerHandle, session_loop_sync, spawn_peer},
         peers::Peers,
@@ -37,6 +41,7 @@ pub struct Ironwood {
     router: Mutex<Router>,
     pathfinder: Mutex<Pathfinder>,
     peers: Mutex<Peers>,
+    sessions: Mutex<SessionManager>,
     recv_q: Mutex<VecDeque<Traffic>>,
     recv_notify: Notify,
     deadline: Deadline,
@@ -61,6 +66,7 @@ impl Ironwood {
             router: Mutex::new(router),
             pathfinder: Mutex::new(pathfinder),
             peers: Mutex::new(Peers::new()),
+            sessions: Mutex::new(SessionManager::new(secret.clone(), GroupAuth::new(""))),
             recv_q: Mutex::new(VecDeque::new()),
             recv_notify: Notify::new(),
             deadline: Deadline::new(),
@@ -79,11 +85,23 @@ impl Ironwood {
         self.recv_q.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn sessions_lock(&self) -> MutexGuard<'_, SessionManager> {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn pathfinder_lock(&self) -> MutexGuard<'_, Pathfinder> {
         self.pathfinder
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+    /// MTU base-слоя (без overhead шифрованной сессии).
+    #[must_use]
+    pub fn base_mtu(&self) -> u64 {
+        self.config
+            .peer_max_message_size
+            .saturating_sub(Traffic::header_size())
+    }
+
     /// Периодическое обслуживание. В Go это `_doMaintenance`; у нас пока
     /// только Bloom'ы — `_fix`/`_sendAnnounces` придут со следующим этапом.
     pub fn do_maintenance(&self) {
@@ -91,12 +109,19 @@ impl Ironwood {
         router.do_maintenance();
         drop(router);
         self.pathfinder_lock().do_maintenance(&self.config);
+        self.sessions_lock()
+            .do_maintenance(std::time::Instant::now());
     }
-    /// Доставить трафик в `recv_q`. Дропаем старые пакеты, если переполнено.
-    fn deliver_local(&self, tr: Traffic) {
-        if tr.dest != *self.crypto.public_key() {
-            return;
-        }
+    /// Положить расшифрованный payload в приёмную очередь.
+    fn push_payload(&self, from: PublicKey, payload: Vec<u8>) {
+        let tr = Traffic {
+            path: Vec::new(),
+            from: Vec::new(),
+            source: from,
+            dest: *self.crypto.public_key(),
+            watermark: 0,
+            payload,
+        };
         let max = self.config.peer_max_message_size;
         {
             let mut q = self.recv_lock();
@@ -111,6 +136,28 @@ impl Ironwood {
             }
         }
         self.recv_notify.notify_one();
+    }
+
+    /// Расшифровать входящий `Traffic` через session manager и выполнить
+    /// его события (доставка/ответный handshake).
+    fn deliver_encrypted(&self, tr: Traffic) {
+        if tr.dest != *self.crypto.public_key() {
+            return;
+        }
+        let events = {
+            let mut sessions = self.sessions_lock();
+            sessions.handle_data(tr.source, &tr.payload, std::time::Instant::now())
+        };
+        for event in events {
+            match event {
+                SessionEvent::Deliver { from, payload } => {
+                    self.push_payload(from, payload);
+                }
+                SessionEvent::Send { dest, data } => {
+                    let _ = self.send_base_now(dest, data, false);
+                }
+            }
+        }
     }
 
     /// Общая логика dispatch. `IronwoodDispatcher` и `IronwoodDispatcherRef`
@@ -132,26 +179,85 @@ impl Ironwood {
                     .handle_response(peer, &res, Duration::ZERO)
             }
             InFrame::Announce(ann) => self.router_lock().handle_announce(peer, &ann),
-            InFrame::PathLookup(_) | InFrame::PathNotify(_) | InFrame::PathBroken(_) => {
-                // TODO: blooms/pathfinder.
+            InFrame::PathLookup(lookup) => {
+                let mut pf = self.pathfinder_lock();
+                let mut router = self.router_lock();
+                pf.handle_lookup(&mut router, peer, &lookup);
+                Ok(())
+            }
+            InFrame::PathNotify(notify) => {
+                let mut pf = self.pathfinder_lock();
+                let mut router = self.router_lock();
+                pf.handle_notify(&mut router, peer, &notify);
+                Ok(())
+            }
+            InFrame::PathBroken(broken) => {
+                let mut pf = self.pathfinder_lock();
+                let mut router = self.router_lock();
+                pf.handle_broken(&mut router, peer, &broken);
                 Ok(())
             }
             InFrame::Traffic(tr) => {
-                let action = self.router_lock().handle_traffic(*tr);
+                let action = self.route_traffic(*tr);
                 match action {
                     TrafficAction::Forward(p, tr) => {
                         p.send_traffic(tr);
                     }
                     TrafficAction::DeliverLocal(tr) => {
-                        self.deliver_local(tr);
+                        self.deliver_encrypted(tr);
                     }
                     TrafficAction::Broken(_) => {
-                        // TODO: pathfinder::handle_broken.
+                        // `route_traffic` уже вызвал pathfinder::do_broken.
                     }
                 }
                 Ok(())
             }
         }
+    }
+
+    /// Маршрутизировать уже заполненный `Traffic` (path/from выставлены).
+    fn route_traffic(&self, tr: Traffic) -> TrafficAction {
+        let mut pf = self.pathfinder_lock();
+        let mut router = self.router_lock();
+        let action = router.handle_traffic(tr);
+        if let TrafficAction::Broken(tr) = &action {
+            pf.do_broken(&mut router, tr);
+        }
+        action
+    }
+
+    /// Количество подключённых пиров (диагностика).
+    #[must_use]
+    pub fn peer_count(&self) -> usize {
+        self.router_lock().iter_peers().count()
+    }
+
+    /// Количество известных `RouterInfo` (диагностика).
+    #[must_use]
+    pub fn info_count(&self) -> usize {
+        self.router_lock().infos.len()
+    }
+
+    /// Знает ли pathfinder маршрут до `key`.
+    #[must_use]
+    pub fn has_path(&self, key: &VerifyingKey) -> bool {
+        self.pathfinder_lock().has_path(key)
+    }
+
+    /// Отправить пакет без pathfinder (пустой `path`), как трафик «вверх».
+    /// Нужен для диагностики прямого пира.
+    ///
+    /// # Errors
+    /// Закрытый сокет или слишком большой пакет.
+    pub async fn send_direct(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize> {
+        let _ = self.send_base_now(*addr.as_key(), buf.to_vec(), true);
+        Ok(buf.len())
+    }
+
+    /// Публичный ключ узла.
+    #[must_use]
+    pub fn public_key(&self) -> VerifyingKey {
+        *self.crypto.public_key()
     }
 
     /// Зарегистрировать свежего `Peer`. `handle` — `Arc<dyn PeerHandle>`,
@@ -164,6 +270,54 @@ impl Ironwood {
     fn unregister_peer(&self, peer: &Arc<Peer>, handle: &Arc<dyn PeerHandle>) {
         self.router_lock().remove_peer(handle);
         self.peers_lock().remove(peer);
+    }
+    /// Отправить уже сформированный `Traffic` через pathfinder (base-слой).
+    /// Возвращает `false`, если путь неизвестен и пакет отложен.
+    fn send_base_now(&self, dest: PublicKey, payload: Vec<u8>, empty_path: bool) -> bool {
+        let tr = Traffic {
+            path: Vec::new(),
+            from: Vec::new(),
+            source: *self.crypto.public_key(),
+            dest,
+            watermark: u64::MAX,
+            payload,
+        };
+        let routed = if empty_path || self.router_lock().is_peer(&dest) {
+            Some(tr)
+        } else {
+            let mut pf = self.pathfinder_lock();
+            let mut router = self.router_lock();
+            pf.handle_traffic(&mut router, tr)
+        };
+        let Some(tr) = routed else {
+            return false;
+        };
+        match self.route_traffic(tr) {
+            TrafficAction::Forward(p, tr) => {
+                p.send_traffic(tr);
+                true
+            }
+            TrafficAction::DeliverLocal(tr) => {
+                self.deliver_encrypted(tr);
+                true
+            }
+            TrafficAction::Broken(_) => false,
+        }
+    }
+
+    /// Отправить payload через base-слой без шифрования (диагностика/тесты).
+    ///
+    /// # Errors
+    /// Закрытый сокет или слишком большой пакет.
+    pub async fn send_base(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(io::Error::other("closed"));
+        }
+        if (buf.len() as u64) > self.base_mtu() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "oversized"));
+        }
+        let _ = self.send_base_now(*addr.as_key(), buf.to_vec(), false);
+        Ok(buf.len())
     }
 }
 
@@ -199,28 +353,19 @@ impl PacketConnBase for Ironwood {
         if (buf.len() as u64) > self.mtu() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "oversized"));
         }
-        let tr = Traffic {
-            path: Vec::new(),
-            from: Vec::new(),
-            source: *self.crypto.public_key(),
-            dest: *addr.as_key(),
-            watermark: u64::MAX,
-            payload: buf.to_vec(),
+        let events = {
+            let mut sessions = self.sessions_lock();
+            sessions.write_to(*addr.as_key(), buf.to_vec(), std::time::Instant::now())
         };
-        let action = self.router_lock().send_traffic(tr);
-        match action {
-            TrafficAction::Forward(p, tr) => {
-                p.send_traffic(tr);
-                Ok(buf.len())
-            }
-            TrafficAction::DeliverLocal(tr) => {
-                self.deliver_local(tr);
-                Ok(buf.len())
-            }
-            TrafficAction::Broken(_) => {
-                Err(io::Error::new(io::ErrorKind::NotFound, "peer not found"))
+        for event in events {
+            match event {
+                SessionEvent::Send { dest, data } => {
+                    let _ = self.send_base_now(dest, data, false);
+                }
+                SessionEvent::Deliver { from, payload } => self.push_payload(from, payload),
             }
         }
+        Ok(buf.len())
     }
 
     fn local_addr(&self) -> io::Result<KeyAddr> {
@@ -295,13 +440,14 @@ impl PacketConnTrait for Ironwood {
     }
 
     fn mtu(&self) -> u64 {
-        self.config
-            .peer_max_message_size
-            .saturating_sub(Traffic::header_size())
+        self.base_mtu()
+            .saturating_sub(crate::ironwood::encrypted::session::SESSION_TRAFFIC_OVERHEAD as u64)
     }
 
-    fn send_lookup(&self, _target: &VerifyingKey) {
-        // TODO: pathfinder::rumor_send_lookup.
+    fn send_lookup(&self, target: &VerifyingKey) {
+        let mut pf = self.pathfinder_lock();
+        let mut router = self.router_lock();
+        pf.send_lookup(&mut router, *target);
     }
 }
 
