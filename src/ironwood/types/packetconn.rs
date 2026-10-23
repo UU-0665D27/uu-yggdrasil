@@ -89,7 +89,7 @@ pub trait PacketConn: PacketConnBase {
     fn mtu(&self) -> u64;
 
     /// Отправить lookup по (возможно частичному) ключу.
-    fn send_lookup(&self, target: &VerifyingKey);
+    fn send_lookup(&self, target: &[u8; 32]);
 }
 
 /// Async-обёртка над sync-ядром. Внутри — `spawn_blocking` + `SyncIoBridge`.
@@ -215,7 +215,7 @@ pub mod fuzz {
         fn mtu(&self) -> u64 {
             1200
         }
-        fn send_lookup(&self, _target: &VerifyingKey) {}
+        fn send_lookup(&self, _target: &[u8; 32]) {}
     }
 
     /// Ввод фаззера: `[key(32) | prio(1) | payload…]`.

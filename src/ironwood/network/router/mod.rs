@@ -374,7 +374,7 @@ impl Router {
     }
     /// `func (bs *blooms) xKey(key)` — трансформация ключа для Bloom'а.
     #[must_use]
-    pub fn x_key(&self, key: &PublicKey) -> [u8; 32] {
+    pub fn x_key(&self, key: &[u8; 32]) -> [u8; 32] {
         (self.config.bloom_transform)(key)
     }
     pub fn handle_bloom(&mut self, peer: &dyn PeerHandle, b: &Bloom) {
@@ -552,6 +552,11 @@ impl Router {
     /// `ProtoTraffic`: маршрутизация + `watermark`-обновление.
     pub fn handle_traffic(&mut self, mut tr: Traffic) -> TrafficAction {
         let self_key = *self.crypto.public_key();
+        // Трафик, адресованный нам, всегда доставляем локально: даже с
+        // пустым `path` (прямой пир) lookup не должен отправить его обратно.
+        if tr.dest == self_key {
+            return TrafficAction::DeliverLocal(tr);
+        }
         let mut wm = tr.watermark;
         let next = self.lookup(&tr.path, Some(&mut wm));
         tr.watermark = wm;
@@ -877,7 +882,7 @@ impl Router {
 
     fn compute_bloom_for(&mut self, key: PublicKey, keep_ones: bool) -> (Bloom, bool) {
         let self_key = *self.crypto.public_key();
-        let xform = (self.config.bloom_transform)(&self_key);
+        let xform = (self.config.bloom_transform)(self_key.as_bytes());
 
         let mut b = Bloom::new();
         b.add_bytes(&xform);

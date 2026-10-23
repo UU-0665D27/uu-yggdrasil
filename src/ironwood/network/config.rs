@@ -6,7 +6,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1_048_576;
 
 /// `func(ed25519.PublicKey) ed25519.PublicKey` из Go.
 /// Возвращаем сырые 32 байта — Bloom оперирует байтами, а не точками на кривой.
-pub type BloomTransform = Arc<dyn Fn(&VerifyingKey) -> [u8; 32] + Send + Sync>;
+pub type BloomTransform = Arc<dyn Fn(&[u8; 32]) -> [u8; 32] + Send + Sync>;
 
 /// `func(ed25519.PublicKey)`.
 pub type PathNotify = Arc<dyn Fn(&VerifyingKey) + Send + Sync>;
@@ -33,7 +33,7 @@ impl Default for Config {
             peer_timeout: Duration::from_secs(3),
             peer_max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             bloom_transform: Arc::new(|k| {
-                crate::address::subnet_get_key(&crate::address::subnet_for_key(k.as_bytes()))
+                crate::address::subnet_get_key(&crate::address::subnet_for_key(k))
             }),
             path_notify: Arc::new(|_| {}),
             path_timeout: Duration::from_secs(60),
@@ -76,7 +76,7 @@ impl Config {
     #[must_use]
     pub fn with_bloom_transform<F>(mut self, f: F) -> Self
     where
-        F: Fn(&VerifyingKey) -> [u8; 32] + Send + Sync + 'static,
+        F: Fn(&[u8; 32]) -> [u8; 32] + Send + Sync + 'static,
     {
         self.bloom_transform = Arc::new(f);
         self

@@ -44,6 +44,8 @@ pub struct Ironwood {
     sessions: Mutex<SessionManager>,
     recv_q: Mutex<VecDeque<Traffic>>,
     recv_notify: Notify,
+    proto_q: Mutex<VecDeque<(PublicKey, Vec<u8>)>>,
+    proto_notify: Notify,
     deadline: Deadline,
     shutdown: CancellationToken,
     closed: AtomicBool,
@@ -69,6 +71,8 @@ impl Ironwood {
             sessions: Mutex::new(SessionManager::new(secret.clone(), GroupAuth::new(""))),
             recv_q: Mutex::new(VecDeque::new()),
             recv_notify: Notify::new(),
+            proto_q: Mutex::new(VecDeque::new()),
+            proto_notify: Notify::new(),
             deadline: Deadline::new(),
             shutdown: CancellationToken::new(),
             closed: AtomicBool::new(false),
@@ -83,6 +87,10 @@ impl Ironwood {
     }
     fn recv_lock(&self) -> MutexGuard<'_, VecDeque<Traffic>> {
         self.recv_q.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn proto_lock(&self) -> MutexGuard<'_, VecDeque<(PublicKey, Vec<u8>)>> {
+        self.proto_q.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn sessions_lock(&self) -> MutexGuard<'_, SessionManager> {
@@ -151,7 +159,13 @@ impl Ironwood {
         for event in events {
             match event {
                 SessionEvent::Deliver { from, payload } => {
-                    self.push_payload(from, payload);
+                    // typeSessionProto = 2; всё остальное — IPv6-трафик.
+                    if payload.first() == Some(&2) {
+                        self.proto_lock().push_back((from, payload));
+                        self.proto_notify.notify_one();
+                    } else {
+                        self.push_payload(from, payload);
+                    }
                 }
                 SessionEvent::Send { dest, data } => {
                     let _ = self.send_base_now(dest, data, false);
@@ -244,6 +258,49 @@ impl Ironwood {
         self.pathfinder_lock().has_path(key)
     }
 
+    /// Инициировать lookup по полному или частичному ключу.
+    pub fn send_lookup_partial(&self, target: &[u8; 32]) {
+        let mut pf = self.pathfinder_lock();
+        let mut router = self.router_lock();
+        pf.send_lookup(&mut router, *target);
+    }
+
+    /// Ключи всех подключённых пиров (без дублей).
+    #[must_use]
+    pub fn peer_keys(&self) -> Vec<PublicKey> {
+        let mut out: Vec<PublicKey> = self.peers_lock().iter_all().map(|p| p.key()).collect();
+        out.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        out.dedup();
+        out
+    }
+
+    /// Следующее proto-сообщение `[2, subtype, ...]` от узла сети.
+    pub async fn recv_proto(&self) -> Option<(PublicKey, Vec<u8>)> {
+        loop {
+            if let Some(item) = self.proto_lock().pop_front() {
+                return Some(item);
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            tokio::select! {
+                () = self.proto_notify.notified() => {}
+                () = self.shutdown.cancelled() => return None,
+            }
+        }
+    }
+
+    /// Отправить proto-сообщение (добавляет `typeSessionProto = 2`).
+    ///
+    /// # Errors
+    /// Ошибки отправки из [`Ironwood::send_to`].
+    pub async fn send_proto(&self, dest: PublicKey, data: &[u8]) -> io::Result<usize> {
+        let mut payload = Vec::with_capacity(data.len() + 1);
+        payload.push(2);
+        payload.extend_from_slice(data);
+        self.send_to(&payload, &KeyAddr(dest)).await
+    }
+
     /// Отправить пакет без pathfinder (пустой `path`), как трафик «вверх».
     /// Нужен для диагностики прямого пира.
     ///
@@ -282,7 +339,19 @@ impl Ironwood {
             watermark: u64::MAX,
             payload,
         };
-        let routed = if empty_path || self.router_lock().is_peer(&dest) {
+        // Прямой пир: не ждём tree/path-lookup, отправляем сразу.
+        {
+            let router = self.router_lock();
+            if router.is_peer(&dest) {
+                let peer = router.best_peer_for(&dest);
+                drop(router);
+                if let Some(peer) = peer {
+                    peer.send_traffic(tr);
+                    return true;
+                }
+            }
+        }
+        let routed = if empty_path {
             Some(tr)
         } else {
             let mut pf = self.pathfinder_lock();
@@ -378,6 +447,7 @@ impl PacketConnBase for Ironwood {
         }
         self.shutdown.cancel();
         self.recv_notify.notify_waiters();
+        self.proto_notify.notify_waiters();
         Ok(())
     }
 
@@ -444,7 +514,7 @@ impl PacketConnTrait for Ironwood {
             .saturating_sub(crate::ironwood::encrypted::session::SESSION_TRAFFIC_OVERHEAD as u64)
     }
 
-    fn send_lookup(&self, target: &VerifyingKey) {
+    fn send_lookup(&self, target: &[u8; 32]) {
         let mut pf = self.pathfinder_lock();
         let mut router = self.router_lock();
         pf.send_lookup(&mut router, *target);

@@ -179,6 +179,16 @@ mod tests {
     }
 
     #[test]
+    fn partial_key_keeps_subnet() {
+        for seed in 0u8..=255 {
+            let pubkey = pubkey(seed);
+            let addr = addr_for_key(&pubkey);
+            let partial = addr_get_key(&addr);
+            assert_eq!(subnet_for_key(&partial), subnet_for_key(&pubkey));
+        }
+    }
+
+    #[test]
     fn address_is_in_yggdrasil_prefix() {
         for seed in 0u8..=255 {
             let addr = addr_for_key(&pubkey(seed));

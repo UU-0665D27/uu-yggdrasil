@@ -16,8 +16,9 @@ crypto_box = { version = "0.9.1", features = ["std"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
+serde_json = "1.0.154"
 sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io-util"] }
-tun = "0.8.14"
+tun = { version = "0.8.14", features = ["async"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }

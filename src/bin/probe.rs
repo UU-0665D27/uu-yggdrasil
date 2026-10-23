@@ -217,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if last_lookup.elapsed() >= Duration::from_secs(2) {
-            node.send_lookup(&dest_key);
+            node.send_lookup(dest_key.as_bytes());
             if !synack {
                 let ip =
                     session_payload(&ipv6_tcp(our_ip, dest_ip, sport, dport, seq, 0, 0x02, &[]));

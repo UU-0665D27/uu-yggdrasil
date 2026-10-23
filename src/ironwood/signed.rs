@@ -138,7 +138,7 @@ impl<P: PacketConn + Send + Sync + 'static> PacketConn for SignedPacketConn<P> {
         self.inner.mtu().saturating_sub(SIG_LEN as u64)
     }
 
-    fn send_lookup(&self, target: &VerifyingKey) {
+    fn send_lookup(&self, target: &[u8; 32]) {
         self.inner.send_lookup(target);
     }
 }

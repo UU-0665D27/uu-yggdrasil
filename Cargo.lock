@@ -882,6 +882,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
@@ -894,12 +895,16 @@ checksum = "8bb55e468c585e02ef89ba7a1a9848871ac942dfc64547ad4d1166b0f61a98be"
 dependencies = [
  "bytes",
  "cfg-if",
+ "futures",
+ "futures-core",
  "ipnet",
  "libc",
  "log",
  "nix",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "windows-sys",
  "wintun-bindings",
 ]
@@ -936,6 +941,7 @@ dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519-dalek",
  "getrandom 0.4.3",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-util",

@@ -26,7 +26,8 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathLookup {
     pub source: PublicKey,
-    pub dest: PublicKey,
+    /// Может быть полным или частичным ключом (из IPv6-адреса).
+    pub dest: [u8; 32],
     pub from: Vec<PeerPort>,
 }
 
@@ -52,7 +53,7 @@ impl PathLookup {
         }
         Ok(Self {
             source: PublicKey::from_bytes(&source).map_err(|_| Error::DECODE)?,
-            dest: PublicKey::from_bytes(&dest).map_err(|_| Error::DECODE)?,
+            dest,
             from,
         })
     }
@@ -69,7 +70,7 @@ impl WireEncodable for PathLookup {
     }
     fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.extend_from_slice(self.source.as_bytes());
-        out.extend_from_slice(self.dest.as_bytes());
+        out.extend_from_slice(&self.dest);
         wire_append_path(out, &self.from);
         Ok(())
     }
@@ -349,17 +350,23 @@ impl Pathfinder {
     // ────────────── lookup: отправка / обработка ──────────────
 
     /// Инициировать lookup для `dest` (throttled).
-    pub fn send_lookup(
-        &mut self,
-        router: &mut Router,
-        dest: crate::ironwood::network::crypto::PublicKey,
-    ) {
-        if let Some(info) = self.paths.get_mut(&dest) {
+    pub fn send_lookup(&mut self, router: &mut Router, dest: [u8; 32]) {
+        if let Ok(full) = PublicKey::from_bytes(&dest)
+            && let Some(info) = self.paths.get_mut(&full)
+        {
             if info.req_time.elapsed() < router.config().path_throttle {
                 return;
             }
             info.req_time = Instant::now();
         }
+        // Lookup может быть инициирован не трафиком, а запросом адреса
+        // (`TUN`/`tcp()`): без rumor'а ответный notify будет отброшен.
+        let xform = router.x_key(&dest);
+        self.rumors.entry(xform).or_insert_with(|| PathRumor {
+            traffic: None,
+            send_time: Instant::now(),
+            last_seen: Instant::now(),
+        });
         let self_key = *router.crypto().public_key();
         let (_, from) = router.get_root_and_path(self_key);
         let lookup = PathLookup {
@@ -395,7 +402,7 @@ impl Pathfinder {
         Self::send_multicast_lookup(router, from_key, lookup);
 
         let dx = router.x_key(&lookup.dest);
-        let sx = router.x_key(router.crypto().public_key());
+        let sx = router.x_key(router.crypto().public_key().as_bytes());
         if dx != sx {
             return;
         }
@@ -499,7 +506,7 @@ impl Pathfinder {
                 return;
             }
         } else {
-            let xform = router.x_key(&source);
+            let xform = router.x_key(source.as_bytes());
             if !self.rumors.contains_key(&xform) {
                 return;
             }
@@ -517,7 +524,7 @@ impl Pathfinder {
             info.last_seen = Instant::now();
             self.paths.insert(source, info);
         } else {
-            let xform = router.x_key(&source);
+            let xform = router.x_key(source.as_bytes());
             if let Some(rumor) = self.rumors.remove(&xform)
                 && let Some(tr) = rumor.traffic
                 && tr.dest == source
@@ -570,7 +577,7 @@ impl Pathfinder {
         if let Some(info) = self.paths.get_mut(&broken.dest) {
             info.broken = true;
         }
-        self.send_lookup(router, broken.dest);
+        self.send_lookup(router, *broken.dest.as_bytes());
     }
 
     /// Сгенерировать `PathBroken` для потерянного трафика.
@@ -592,7 +599,7 @@ impl Pathfinder {
         router: &mut Router,
         dest: crate::ironwood::network::crypto::PublicKey,
     ) {
-        let xform = router.x_key(&dest);
+        let xform = router.x_key(dest.as_bytes());
         if let Some(rumor) = self.rumors.get_mut(&xform) {
             if rumor.send_time.elapsed() < router.config().path_throttle {
                 return;
@@ -609,7 +616,7 @@ impl Pathfinder {
                 },
             );
         }
-        self.send_lookup(router, dest);
+        self.send_lookup(router, *dest.as_bytes());
     }
 
     /// Основной вход трафика: если путь известен — вернуть `Traffic` с
@@ -625,7 +632,7 @@ impl Pathfinder {
             return Some(tr);
         }
         self.rumor_send_lookup(router, tr.dest);
-        let xform = router.x_key(&tr.dest);
+        let xform = router.x_key(tr.dest.as_bytes());
         if let Some(rumor) = self.rumors.get_mut(&xform) {
             rumor.traffic = Some(tr);
         }
@@ -693,7 +700,7 @@ mod wire_tests {
     fn lookup_roundtrip() {
         let l = PathLookup {
             source: sk(1).verifying_key(),
-            dest: sk(2).verifying_key(),
+            dest: *sk(2).verifying_key().as_bytes(),
             from: vec![1, 300, u64::MAX],
         };
         let out = encode(&l);
