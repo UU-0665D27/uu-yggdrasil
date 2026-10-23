@@ -32,7 +32,9 @@ impl Default for Config {
             peer_keep_alive_delay: Duration::from_secs(1),
             peer_timeout: Duration::from_secs(3),
             peer_max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            bloom_transform: Arc::new(|k| *k.as_bytes()),
+            bloom_transform: Arc::new(|k| {
+                crate::address::subnet_get_key(&crate::address::subnet_for_key(k.as_bytes()))
+            }),
             path_notify: Arc::new(|_| {}),
             path_timeout: Duration::from_secs(60),
             path_throttle: Duration::from_secs(1),

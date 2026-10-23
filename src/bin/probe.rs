@@ -6,14 +6,13 @@
 
 use std::net::Ipv6Addr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 
-use uu_yggdrasil::address::{addr_for_key, subnet_for_key, subnet_get_key};
+use uu_yggdrasil::address::addr_for_key;
 use uu_yggdrasil::ironwood::{
     Ironwood, KeyAddr, PacketConn, PacketConnBase,
     network::{Config, handshake_async, spawn_conn},
@@ -188,9 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         meta.minor
     );
 
-    let mut config = Config::default();
-    config.bloom_transform = Arc::new(|key| subnet_get_key(&subnet_for_key(key.as_bytes())));
-    let node = Ironwood::new(&secret, config)?;
+    let node = Ironwood::new(&secret, Config::default())?;
     let remote_key = meta.public_key;
     let node_task = {
         let node = node.clone();
