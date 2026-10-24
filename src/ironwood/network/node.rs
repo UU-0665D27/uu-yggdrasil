@@ -104,7 +104,7 @@ impl Ironwood {
     }
     /// MTU base-слоя (без overhead шифрованной сессии).
     #[must_use]
-    pub fn base_mtu(&self) -> u64 {
+    pub const fn base_mtu(&self) -> u64 {
         self.config
             .peer_max_message_size
             .saturating_sub(Traffic::header_size())
@@ -150,7 +150,7 @@ impl Ironwood {
 
     /// Расшифровать входящий `Traffic` через session manager и выполнить
     /// его события (доставка/ответный handshake).
-    fn deliver_encrypted(&self, tr: Traffic) {
+    fn deliver_encrypted(&self, tr: &Traffic) {
         if tr.dest != *self.crypto.public_key() {
             return;
         }
@@ -199,18 +199,21 @@ impl Ironwood {
                 let mut pf = self.pathfinder_lock();
                 let mut router = self.router_lock();
                 pf.handle_lookup(&mut router, peer, &lookup);
+                drop(pf);
                 Ok(())
             }
             InFrame::PathNotify(notify) => {
                 let mut pf = self.pathfinder_lock();
                 let mut router = self.router_lock();
                 pf.handle_notify(&mut router, peer, &notify);
+                drop(pf);
                 Ok(())
             }
             InFrame::PathBroken(broken) => {
                 let mut pf = self.pathfinder_lock();
                 let mut router = self.router_lock();
                 pf.handle_broken(&mut router, peer, &broken);
+                drop(pf);
                 Ok(())
             }
             InFrame::Traffic(tr) => {
@@ -220,7 +223,7 @@ impl Ironwood {
                         p.send_traffic(tr);
                     }
                     TrafficAction::DeliverLocal(tr) => {
-                        self.deliver_encrypted(tr);
+                        self.deliver_encrypted(&tr);
                     }
                     TrafficAction::Broken(_) => {
                         // `route_traffic` уже вызвал pathfinder::do_broken.
@@ -239,6 +242,8 @@ impl Ironwood {
         if let TrafficAction::Broken(tr) = &action {
             pf.do_broken(&mut router, tr);
         }
+        drop(pf);
+        drop(router);
         action
     }
 
@@ -279,7 +284,8 @@ impl Ironwood {
     /// Следующее proto-сообщение `[2, subtype, ...]` от узла сети.
     pub async fn recv_proto(&self) -> Option<(PublicKey, Vec<u8>)> {
         loop {
-            if let Some(item) = self.proto_lock().pop_front() {
+            let item = self.proto_lock().pop_front();
+            if let Some(item) = item {
                 return Some(item);
             }
             if self.closed.load(Ordering::SeqCst) {
@@ -308,7 +314,7 @@ impl Ironwood {
     ///
     /// # Errors
     /// Закрытый сокет или слишком большой пакет.
-    pub async fn send_direct(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize> {
+    pub fn send_direct(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize> {
         let _ = self.send_base_now(*addr.as_key(), buf.to_vec(), true);
         Ok(buf.len())
     }
@@ -381,7 +387,7 @@ impl Ironwood {
                 true
             }
             TrafficAction::DeliverLocal(tr) => {
-                self.deliver_encrypted(tr);
+                self.deliver_encrypted(&tr);
                 true
             }
             TrafficAction::Broken(_) => false,
@@ -392,7 +398,7 @@ impl Ironwood {
     ///
     /// # Errors
     /// Закрытый сокет или слишком большой пакет.
-    pub async fn send_base(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize> {
+    pub fn send_base(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(io::Error::other("closed"));
         }

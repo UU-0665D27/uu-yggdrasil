@@ -228,7 +228,7 @@ mod tests {
     }
 
     impl Pkt {
-        fn new(src: u8, dst: u8, payload: &[u8]) -> Box<dyn PqPacket> {
+        fn boxed(src: u8, dst: u8, payload: &[u8]) -> Box<dyn PqPacket> {
             Box::new(Self {
                 src: key(src),
                 dst: key(dst),
@@ -278,8 +278,8 @@ mod tests {
     #[test]
     fn fifo_within_stream_and_size_accounting() {
         let mut q = PacketQueue::new();
-        q.push(Pkt::new(1, 2, b"a"));
-        q.push(Pkt::new(1, 2, b"bb"));
+        q.push(Pkt::boxed(1, 2, b"a"));
+        q.push(Pkt::boxed(1, 2, b"bb"));
         assert_eq!(q.size(), 3);
         assert_eq!(q.peek().expect("peek").1, 1);
         assert_eq!(payload(q.pop().expect("pop").as_ref()), b"a");
@@ -293,10 +293,10 @@ mod tests {
     fn pop_is_globally_oldest_packet() {
         let mut q = PacketQueue::new();
         // A создан первым, но после опустошения его голова новее B.
-        q.push(Pkt::new(1, 1, b"a1")); // dest A, t0
-        q.push(Pkt::new(1, 2, b"b1")); // dest B, t1
+        q.push(Pkt::boxed(1, 1, b"a1")); // dest A, t0
+        q.push(Pkt::boxed(1, 2, b"b1")); // dest B, t1
         std::thread::sleep(std::time::Duration::from_millis(2));
-        q.push(Pkt::new(1, 1, b"a2")); // dest A, t2 (голова A теперь a2)
+        q.push(Pkt::boxed(1, 1, b"a2")); // dest A, t2 (голова A теперь a2)
 
         assert_eq!(payload(q.pop().expect("pop").as_ref()), b"a1");
         // Должен уйти b1 (t1), а не a2 (t2), хотя dest A стоит раньше.
@@ -308,10 +308,10 @@ mod tests {
     fn drop_oldest_from_largest_pair() {
         let mut q = PacketQueue::new();
         // dest1: source1 (2+2), source2 (1); dest2: source1 (5)
-        q.push(Pkt::new(1, 1, b"xx"));
-        q.push(Pkt::new(2, 1, b"y"));
-        q.push(Pkt::new(1, 1, b"zz"));
-        q.push(Pkt::new(3, 2, b"12345"));
+        q.push(Pkt::boxed(1, 1, b"xx"));
+        q.push(Pkt::boxed(2, 1, b"y"));
+        q.push(Pkt::boxed(1, 1, b"zz"));
+        q.push(Pkt::boxed(3, 2, b"12345"));
         assert_eq!(q.size(), 10);
 
         // Самая большая пара dest1 -> source1 (4): выкидываем её голову xx.

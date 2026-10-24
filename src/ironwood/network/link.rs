@@ -76,7 +76,7 @@ fn put_u16(out: &mut Vec<u8>, v: u16) {
 /// Собрать `meta` для отправки. `password` — общий пароль (может быть пустым).
 ///
 /// # Errors
-/// Только если пароль длиннее 64 байт (ограничение BLAKE2b).
+/// Только если пароль длиннее 64 байт (ограничение `BLAKE2b`).
 pub fn encode_meta(secret: &SigningKey, password: &[u8], priority: u8) -> io::Result<Vec<u8>> {
     let public = secret.verifying_key();
     let mut out = Vec::with_capacity(META_HEADER_SIZE + 120);
@@ -223,7 +223,7 @@ pub fn read_meta<R: Read + ?Sized>(r: &mut R, password: &[u8]) -> io::Result<Lin
         return Err(invalid("invalid preamble"));
     }
     let len = usize::from(u16::from_be_bytes([header[4], header[5]]));
-    if len < SIG_SIZE || len > META_MAX_SIZE {
+    if !(SIG_SIZE..=META_MAX_SIZE).contains(&len) {
         return Err(invalid("invalid meta length"));
     }
     let mut body = vec![0u8; len];
@@ -249,7 +249,7 @@ pub async fn read_meta_async<R: AsyncRead + Unpin + ?Sized>(
         return Err(invalid("invalid preamble"));
     }
     let len = usize::from(u16::from_be_bytes([header[4], header[5]]));
-    if len < SIG_SIZE || len > META_MAX_SIZE {
+    if !(SIG_SIZE..=META_MAX_SIZE).contains(&len) {
         return Err(invalid("invalid meta length"));
     }
     let mut full = vec![0u8; META_HEADER_SIZE + len];
@@ -338,7 +338,7 @@ mod tests {
             assert!(decode_meta(&bad, b"").is_err(), "sig byte {i}");
         }
         // Версия и priority в Go не подписаны: меняются, но не ломают подпись.
-        let mut bad = bs.clone();
+        let mut bad = bs;
         bad[11] = 9; // major value low byte
         let meta = decode_meta(&bad, b"").expect("version is not signed");
         assert!(!meta.is_compatible());
@@ -352,7 +352,7 @@ mod tests {
         let mut cursor = buf.as_slice();
         let meta = read_meta(&mut cursor, b"pw").expect("read");
         assert_eq!(meta.public_key, sk.verifying_key());
-        assert!(cursor.is_empty());
+        assert_eq!(cursor, &[] as &[u8]);
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
         assert!(decode_meta(&bs[..bs.len() - 1], b"").is_err());
         assert!(decode_meta(&[&b"meta"[..], &[0xff, 0xff][..]].concat(), b"").is_err());
 
-        let mut bad = bs.clone();
+        let mut bad = bs;
         bad[4] = 0;
         bad[5] = 10; // меньше подписи
         assert!(decode_meta(&bad, b"").is_err());

@@ -233,7 +233,7 @@ mod tests {
             assert_eq!(v.len(), wire_size_uint(u));
             let mut s = v.as_slice();
             assert_eq!(wire_chop_uint(&mut s), Some(u));
-            assert!(s.is_empty());
+            assert_eq!(s, &[] as &[u8]);
         }
     }
 
@@ -259,7 +259,7 @@ mod tests {
             let mut got = Vec::new();
             assert!(wire_chop_path(&mut got, &mut rest));
             assert_eq!(got, path);
-            assert!(rest.is_empty());
+            assert_eq!(rest, &[] as &[u8]);
         }
     }
 

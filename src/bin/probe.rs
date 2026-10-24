@@ -44,25 +44,26 @@ fn session_payload(ip: &[u8]) -> Vec<u8> {
 fn checksum(src: &[u8; 16], dst: &[u8; 16], tcp: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut add = |bytes: &[u8]| {
-        let mut chunks = bytes.chunks_exact(2);
-        for c in &mut chunks {
+        let (chunks, remainder) = bytes.as_chunks::<2>();
+        for c in chunks {
             sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
         }
-        if let Some(&last) = chunks.remainder().first() {
+        if let Some(&last) = remainder.first() {
             sum += u32::from(u16::from_be_bytes([last, 0]));
         }
     };
     add(src);
     add(dst);
-    add(&(tcp.len() as u32).to_be_bytes());
+    add(&u32::try_from(tcp.len()).expect("TCP length").to_be_bytes());
     add(&[0, 0, 0, 6]);
     add(tcp);
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !(sum as u16)
+    !u16::try_from(sum).expect("checksum")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ipv6_tcp(
     src: Ipv6Addr,
     dst: Ipv6Addr,
@@ -108,22 +109,26 @@ fn icmpv6_echo(src: Ipv6Addr, dst: Ipv6Addr, id: u16, seq: u16) -> Vec<u8> {
     let mut pseudo = Vec::with_capacity(40);
     pseudo.extend_from_slice(&src.octets());
     pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(
+        &u32::try_from(icmp.len())
+            .expect("ICMP length")
+            .to_be_bytes(),
+    );
     pseudo.extend_from_slice(&[0, 0, 0, 58]);
     pseudo.extend_from_slice(&icmp);
     // Тот же one's complement, но без TCP-заголовка.
     let mut sum = 0u32;
-    let mut chunks = pseudo.chunks_exact(2);
-    for c in &mut chunks {
+    let (chunks, remainder) = pseudo.as_chunks::<2>();
+    for c in chunks {
         sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
     }
-    if let Some(&last) = chunks.remainder().first() {
+    if let Some(&last) = remainder.first() {
         sum += u32::from(u16::from_be_bytes([last, 0]));
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    let csum = !(sum as u16);
+    let csum = !u16::try_from(sum).expect("checksum");
     icmp[2..4].copy_from_slice(&csum.to_be_bytes());
 
     let mut ip = vec![0u8; 40];
@@ -157,6 +162,7 @@ fn parse_tcp(pkt: &[u8], sport: u16, dport: u16) -> Option<(u8, u32, u32, &[u8])
     Some((flags, seq, ack, &tcp[off..]))
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -197,7 +203,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    let sport = 40000 + (std::process::id() % 20000) as u16;
+    let sport =
+        40000 + u16::try_from(std::process::id() % 20000).expect("ephemeral source port offset");
     let seq = 0x1234_5678u32;
 
     let deadline = Instant::now() + Duration::from_secs(60);

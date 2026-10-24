@@ -183,10 +183,15 @@ pub(crate) struct Inner {
 
 impl Yggdrasil {
     /// Создать узел. Если `config.tun` задан, интерфейс создаётся сразу;
-    /// для этого нужны root/CAP_NET_ADMIN.
+    /// для этого нужны `root/CAP_NET_ADMIN`.
     ///
     /// # Errors
     /// Ошибка создания TUN, настройки адреса/маршрута или инициализации ядра.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::unused_async,
+        clippy::unused_async_trait_impl
+    )]
     pub async fn new(mut config: YggdrasilConfig) -> io::Result<Self> {
         let key = config.private_key.verifying_key();
         let address = addr_for_key(key.as_bytes());
@@ -230,7 +235,7 @@ impl Yggdrasil {
                     }
                 }
             });
-            inner.tasks.lock().unwrap().push(task);
+            inner.push_task(task);
         }
 
         // Полные ключи из path-notify: addr -> key, затем разбудить
@@ -249,7 +254,7 @@ impl Yggdrasil {
                     task_inner.flush_buffered(addr).await;
                 }
             });
-            inner.tasks.lock().unwrap().push(task);
+            inner.push_task(task);
         }
 
         // node_info request/response.
@@ -290,18 +295,24 @@ impl Yggdrasil {
                     }
                 }
             });
-            inner.tasks.lock().unwrap().push(task);
+            inner.push_task(task);
         }
 
-        if let Some(tun_config) = config.tun {
-            if let Err(error) = inner.start_tun(&tun_config) {
-                inner.shutdown.cancel();
-                let _ = node.close();
-                for task in inner.tasks.lock().unwrap().drain(..) {
-                    task.abort();
-                }
-                return Err(error);
+        if let Some(tun_config) = config.tun
+            && let Err(error) = inner.start_tun(&tun_config)
+        {
+            inner.shutdown.cancel();
+            let _ = node.close();
+            let tasks = inner
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain(..)
+                .collect::<Vec<_>>();
+            for task in tasks {
+                task.abort();
             }
+            return Err(error);
         }
 
         Ok(Self { inner })
@@ -390,7 +401,7 @@ impl Yggdrasil {
                 });
             }
         });
-        self.inner.tasks.lock().unwrap().push(task);
+        self.inner.push_task(task);
         Ok(local)
     }
 
@@ -733,6 +744,7 @@ impl Inner {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn start_tun(self: &Arc<Self>, config: &TunConfig) -> io::Result<()> {
         let mut tun_config = tun::Configuration::default();
         tun_config
@@ -807,11 +819,14 @@ impl Inner {
                                 .pending_packets
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let queue = pending.entry(addr).or_default();
-                            if queue.len() >= MAX_BUFFERED_PACKETS {
-                                queue.remove(0);
+                            {
+                                let queue = pending.entry(addr).or_default();
+                                if queue.len() >= MAX_BUFFERED_PACKETS {
+                                    queue.remove(0);
+                                }
+                                queue.push(buf[..n].to_vec());
                             }
-                            queue.push(buf[..n].to_vec());
+                            drop(pending);
                         }
                         if should_lookup {
                             inner.node.send_lookup_partial(&addr_get_key(&addr));
@@ -819,7 +834,7 @@ impl Inner {
                     }
                 }
             });
-            self.tasks.lock().unwrap().push(task);
+            self.push_task(task);
         }
 
         // yggdrasil -> TUN.
@@ -831,14 +846,12 @@ impl Inner {
                     let Ok((n, _)) = inner.node.recv_from(&mut buf).await else {
                         break;
                     };
-                    if n > 1 && buf[0] == 1 {
-                        if tx.send(buf[1..n].to_vec()).await.is_err() {
-                            break;
-                        }
+                    if n > 1 && buf[0] == 1 && tx.send(buf[1..n].to_vec()).await.is_err() {
+                        break;
                     }
                 }
             });
-            self.tasks.lock().unwrap().push(task);
+            self.push_task(task);
         }
 
         // writer
@@ -851,7 +864,7 @@ impl Inner {
                     }
                 }
             });
-            self.tasks.lock().unwrap().push(task);
+            self.push_task(task);
         }
 
         Ok(())
@@ -986,7 +999,7 @@ impl PeerUri {
             }
         }
         Ok(Self {
-            host: host.to_owned(),
+            host,
             port,
             key,
             password,

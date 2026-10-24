@@ -185,40 +185,37 @@ impl Router {
         let ms = self
             .lags
             .get(&arc_identity(handle))
-            .map_or(0, |d| d.as_millis() as u64);
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         ms.max(1)
     }
 
     /// Go `_fix`: выбрать лучшего родителя/корень.
     fn fix(&mut self) {
         let self_key = *self.crypto.public_key();
-        let Some(self_info) = self.infos.get(&self_key).cloned() else {
+        let Some(self_info) = self.infos.get(&self_key).copied() else {
             return;
         };
 
-        let mut best_root = self_key;
-        let mut best_parent = self_key;
-        let mut best_cost = u64::MAX;
-
-        if self.peers.contains_key(&self_info.parent)
-            && let Some((root, dists)) = self.get_root_and_dists(self_key)
-            && public_key_less(&root, &best_root)
-        {
-            let mut cost = u64::MAX;
-            if let Some(peers) = self.peers.get(&self_info.parent) {
-                for p in peers {
-                    let c = dists
-                        .get(&root)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_mul(self.peer_cost(&p.handle));
-                    cost = cost.min(c);
+        let (mut best_root, mut best_parent, mut best_cost) =
+            if self.peers.contains_key(&self_info.parent)
+                && let Some((root, dists)) = self.get_root_and_dists(self_key)
+                && public_key_less(&root, &self_key)
+            {
+                let mut cost = u64::MAX;
+                if let Some(peers) = self.peers.get(&self_info.parent) {
+                    for p in peers {
+                        let c = dists
+                            .get(&root)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_mul(self.peer_cost(&p.handle));
+                        cost = cost.min(c);
+                    }
                 }
-            }
-            best_root = root;
-            best_parent = self_info.parent;
-            best_cost = cost;
-        }
+                (root, self_info.parent, cost)
+            } else {
+                (self_key, self_key, u64::MAX)
+            };
 
         let response_keys: Vec<PublicKey> = self.responses.keys().copied().collect();
         for pk in response_keys {

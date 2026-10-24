@@ -172,9 +172,9 @@ mod tests {
         let mut out = Vec::new();
         tr.encode(&mut out).expect("encode");
         let got = Traffic::decode(&out).expect("decode");
-        assert!(got.payload.is_empty());
-        assert!(got.path.is_empty());
-        assert!(got.from.is_empty());
+        assert_eq!(got.payload, [] as [u8; 0]);
+        assert_eq!(got.path, [] as [u64; 0]);
+        assert_eq!(got.from, [] as [u64; 0]);
     }
 
     #[test]
