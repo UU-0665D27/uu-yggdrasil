@@ -5,7 +5,7 @@
 //! проверка: публичный ключ из сертификата должен совпасть с ключом источника
 //! пакета, который уже аутентифицирован транспортом yggdrasil.
 
-use std::{io, sync::Arc};
+use std::{hash::Hasher, io, sync::Arc};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{
@@ -13,9 +13,15 @@ use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls::{
         self,
-        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
-        server::danger::{ClientCertVerified, ClientCertVerifier},
+        client::danger::{
+            HandshakeSignatureValid, ServerIdentity, ServerVerifier, SignatureVerificationInput,
+        },
+        crypto::{Identity, SignatureScheme, VerifiedIdentity, WebPkiSupportedAlgorithms},
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        server::{
+            InvalidSniPolicy,
+            danger::{ClientIdentity, ClientVerifier},
+        },
     },
 };
 use rcgen::{
@@ -32,25 +38,27 @@ pub struct TlsConfigs {
 /// Собрать сертификат из ключа узла и TLS-конфигурации Quinn.
 pub fn build(secret: &SigningKey, transport: Arc<TransportConfig>) -> io::Result<TlsConfigs> {
     let (cert, key) = self_signed(secret)?;
-    let provider = rustls::crypto::ring::default_provider();
+    let provider = Arc::new(rustls_ring::DEFAULT_PROVIDER);
     let algs = provider.signature_verification_algorithms;
+    let identity = Arc::new(
+        Identity::from_cert_chain(vec![cert])
+            .map_err(|error| io::Error::other(format!("TLS identity: {error}")))?,
+    );
 
-    let client_rustls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|error| io::Error::other(format!("TLS versions: {error}")))?
+    let client_rustls = rustls::ClientConfig::builder(Arc::clone(&provider))
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServer { algs }))
-        .with_client_auth_cert(vec![cert.clone()], key.clone_key())
+        .with_client_auth_cert(Arc::clone(&identity), key.clone_key())
         .map_err(|error| io::Error::other(format!("TLS client cert: {error}")))?;
 
-    let server_rustls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|error| io::Error::other(format!("TLS versions: {error}")))?
-    .with_client_cert_verifier(Arc::new(AcceptAnyClient { algs }))
-    .with_single_cert(vec![cert], key)
-    .map_err(|error| io::Error::other(format!("TLS server cert: {error}")))?;
+    let mut server_rustls = rustls::ServerConfig::builder(Arc::clone(&provider))
+        .with_client_cert_verifier(Arc::new(AcceptAnyClient { algs }))
+        .with_single_cert(identity, key)
+        .map_err(|error| io::Error::other(format!("TLS server cert: {error}")))?;
+    // Go's yggquic sends the peer public key hex as SNI, which rustls rejects
+    // as an invalid DNS name (a single label longer than 63 bytes). The
+    // identity is verified separately against the yggdrasil source key.
+    server_rustls.invalid_sni_policy = InvalidSniPolicy::IgnoreAll;
 
     let quic_client = QuicClientConfig::try_from(client_rustls)
         .map_err(|error| io::Error::other(format!("QUIC client TLS: {error}")))?;
@@ -135,84 +143,76 @@ fn ed25519_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 
 #[derive(Debug)]
 struct AcceptAnyServer {
-    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+    algs: WebPkiSupportedAlgorithms,
 }
 
-impl ServerCertVerifier for AcceptAnyServer {
-    fn verify_server_cert(
+impl ServerVerifier for AcceptAnyServer {
+    fn verify_identity<'a>(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
+        identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, rustls::Error> {
         // Идентичность проверяется после handshake по ключу источника
         // yggdrasil-пакета.
-        Ok(ServerCertVerified::assertion())
+        Ok(VerifiedIdentity::assertion(identity.identity.clone()))
     }
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+        rustls::crypto::verify_tls12_signature(input, &self.algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+        rustls::crypto::verify_tls13_signature(input, &self.algs)
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algs.supported_schemes()
     }
+
+    fn request_ocsp_response(&self) -> bool {
+        false
+    }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
 }
 
 #[derive(Debug)]
 struct AcceptAnyClient {
-    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+    algs: WebPkiSupportedAlgorithms,
 }
 
-impl ClientCertVerifier for AcceptAnyClient {
-    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
+impl ClientVerifier for AcceptAnyClient {
+    fn verify_identity<'a>(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
-    ) -> Result<ClientCertVerified, rustls::Error> {
-        Ok(ClientCertVerified::assertion())
+        identity: &ClientIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, rustls::Error> {
+        Ok(VerifiedIdentity::assertion(identity.identity.clone()))
     }
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+        rustls::crypto::verify_tls12_signature(input, &self.algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+        rustls::crypto::verify_tls13_signature(input, &self.algs)
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    fn root_hint_subjects(&self) -> Arc<[rustls::DistinguishedName]> {
+        Arc::from(Vec::<rustls::DistinguishedName>::new())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algs.supported_schemes()
     }
 }

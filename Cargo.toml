@@ -28,7 +28,11 @@ crypto_box = { version = "0.9.1", features = ["std"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
-quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn = { git = "https://github.com/iadev09/quinn", branch = "rustls-0.24-upgrade", default-features = false, features = ["runtime-tokio", "rustls-ring", "tracing-log"] }
+# rustls PR #2617 (`InvalidSniPolicy`) is merged into rustls main, which the
+# quinn PR above already tracks. This direct dependency is for the ring
+# `CryptoProvider`, which rustls 0.24 moved out of the `rustls` crate.
+rustls-ring = { git = "https://github.com/rustls/rustls", branch = "main", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

@@ -1089,9 +1089,8 @@ dependencies = [
 
 [[package]]
 name = "quinn"
-version = "0.11.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
+version = "0.12.0"
+source = "git+https://github.com/iadev09/quinn?branch=rustls-0.24-upgrade#074b2493e73420fc58bdddb9e9ff635df4ef36c1"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1100,6 +1099,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
+ "rustls-ring",
  "socket2",
  "thiserror",
  "tokio",
@@ -1109,9 +1109,8 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
+version = "0.12.0"
+source = "git+https://github.com/iadev09/quinn?branch=rustls-0.24-upgrade#074b2493e73420fc58bdddb9e9ff635df4ef36c1"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -1122,6 +1121,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
+ "rustls-ring",
  "slab",
  "thiserror",
  "tinyvec",
@@ -1131,16 +1131,14 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
+version = "0.6.3"
+source = "git+https://github.com/iadev09/quinn?branch=rustls-0.24-upgrade#074b2493e73420fc58bdddb9e9ff635df4ef36c1"
 dependencies = [
  "cfg_aliases",
  "libc",
- "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1272,12 +1270,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+version = "0.24.0-dev.2"
+source = "git+https://github.com/rustls/rustls?branch=main#28ee6c688e1567d5bd77d2c6f34e704f62e8bdde"
 dependencies = [
- "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -1295,12 +1290,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-webpki"
-version = "0.103.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
+name = "rustls-ring"
+version = "0.24.0-dev.2"
+source = "git+https://github.com/rustls/rustls?branch=main#28ee6c688e1567d5bd77d2c6f34e704f62e8bdde"
 dependencies = [
  "ring",
+ "rustls",
+ "rustls-pki-types",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.104.0-alpha.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4f05eb03bb89c8b88908947d1add6fbe564e58db7b686dbda59691aaec0e450"
+dependencies = [
  "rustls-pki-types",
  "untrusted",
 ]
@@ -1790,6 +1796,7 @@ dependencies = [
  "getrandom 0.4.3",
  "quinn",
  "rcgen",
+ "rustls-ring",
  "serde",
  "serde_json",
  "sha2",

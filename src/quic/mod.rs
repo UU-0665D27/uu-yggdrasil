@@ -24,7 +24,7 @@ use std::{
 
 use quinn::{
     AsyncUdpSocket, Endpoint, EndpointConfig, IdleTimeout, TokioRuntime, TransportConfig,
-    UdpPoller,
+    UdpSender,
     udp::{RecvMeta, Transmit},
 };
 use tokio::{
@@ -89,19 +89,15 @@ impl YggdrasilQuic {
 
         let local = SocketAddr::new(IpAddr::V6(local_address), QUIC_PORT);
         let (send_tx, send_rx) = mpsc::unbounded_channel();
-        let socket = Arc::new(YggUdpSocket::new(Arc::clone(&addr_to_key), local, send_tx));
+        let socket = YggUdpSocket::new(Arc::clone(&addr_to_key), local, send_tx);
 
-        spawn_receive_pump(
-            Arc::clone(&socket),
-            Arc::clone(inner.node()),
-            shutdown.clone(),
-        );
+        spawn_receive_pump(socket.clone(), Arc::clone(inner.node()), shutdown.clone());
         spawn_send_pump(Arc::clone(inner.node()), send_rx, shutdown.clone());
 
-        let mut endpoint = Endpoint::new_with_abstract_socket(
+        let endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),
             Some(tls.server),
-            socket,
+            Box::new(socket),
             Arc::new(TokioRuntime),
         )?;
         endpoint.set_default_client_config(tls.client);
@@ -355,7 +351,7 @@ fn strip_traffic_prefix(datagram: &[u8]) -> &[u8] {
 }
 
 fn spawn_receive_pump(
-    socket: Arc<YggUdpSocket>,
+    socket: YggUdpSocket,
     node: Arc<crate::ironwood::network::Ironwood>,
     shutdown: CancellationToken,
 ) {
@@ -557,14 +553,13 @@ fn verify_peer(connection: &quinn::Connection, expected: PublicKey) -> bool {
     let Some(identity) = connection.peer_identity() else {
         return false;
     };
-    let Ok(certs) = identity.downcast::<Vec<quinn::rustls::pki_types::CertificateDer<'static>>>()
-    else {
+    let Ok(identity) = identity.downcast::<quinn::rustls::crypto::Identity<'static>>() else {
         return false;
     };
-    let [cert] = certs.as_slice() else {
+    let quinn::rustls::crypto::Identity::X509(certificates) = *identity else {
         return false;
     };
-    tls::certificate_key(cert) == Some(expected)
+    tls::certificate_key(&certificates.end_entity) == Some(expected)
 }
 
 fn key_for_socket(
@@ -590,15 +585,16 @@ struct RecvState {
     waker: Option<Waker>,
 }
 
+#[derive(Clone)]
 struct YggUdpSocket {
     addr_to_key: Arc<RwLock<HashMap<Address, PublicKey>>>,
     local: SocketAddr,
     send: mpsc::UnboundedSender<(PublicKey, Vec<u8>)>,
-    recv: Mutex<RecvState>,
+    recv: Arc<Mutex<RecvState>>,
 }
 
 impl YggUdpSocket {
-    const fn new(
+    fn new(
         addr_to_key: Arc<RwLock<HashMap<Address, PublicKey>>>,
         local: SocketAddr,
         send: mpsc::UnboundedSender<(PublicKey, Vec<u8>)>,
@@ -607,10 +603,10 @@ impl YggUdpSocket {
             addr_to_key,
             local,
             send,
-            recv: Mutex::new(RecvState {
+            recv: Arc::new(Mutex::new(RecvState {
                 queue: VecDeque::new(),
                 waker: None,
-            }),
+            })),
         }
     }
 
@@ -645,11 +641,62 @@ impl fmt::Debug for YggUdpSocket {
 }
 
 impl AsyncUdpSocket for YggUdpSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(AlwaysWritable)
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(YggUdpSender {
+            addr_to_key: Arc::clone(&self.addr_to_key),
+            local: self.local,
+            send: self.send.clone(),
+        })
     }
 
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let Some(buf) = bufs.first_mut() else {
+            return Poll::Ready(Ok(0));
+        };
+        let Some(meta) = meta.first_mut() else {
+            return Poll::Ready(Ok(0));
+        };
+        let mut state = self.recv.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(received) = state.queue.pop_front() else {
+            state.waker = Some(cx.waker().clone());
+            drop(state);
+            return Poll::Pending;
+        };
+        drop(state);
+        let (data, addr) = received;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        let mut received_meta = RecvMeta::default();
+        received_meta.addr = addr;
+        received_meta.len = n;
+        received_meta.stride = n;
+        *meta = received_meta;
+        Poll::Ready(Ok(1))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+struct YggUdpSender {
+    addr_to_key: Arc<RwLock<HashMap<Address, PublicKey>>>,
+    local: SocketAddr,
+    send: mpsc::UnboundedSender<(PublicKey, Vec<u8>)>,
+}
+
+impl YggUdpSender {
+    fn send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         let IpAddr::V6(ip) = transmit.destination.ip() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -684,54 +731,15 @@ impl AsyncUdpSocket for YggUdpSocket {
             .send((key, transmit.contents.to_vec()))
             .map_err(|_| transport_closed())
     }
-
-    fn poll_recv(
-        &self,
-        cx: &mut Context,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> Poll<io::Result<usize>> {
-        let Some(buf) = bufs.first_mut() else {
-            return Poll::Ready(Ok(0));
-        };
-        let Some(meta) = meta.first_mut() else {
-            return Poll::Ready(Ok(0));
-        };
-        let mut state = self.recv.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(received) = state.queue.pop_front() else {
-            state.waker = Some(cx.waker().clone());
-            drop(state);
-            return Poll::Pending;
-        };
-        drop(state);
-        let (data, addr) = received;
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        *meta = RecvMeta {
-            addr,
-            len: n,
-            stride: n,
-            ecn: None,
-            dst_ip: None,
-        };
-        Poll::Ready(Ok(1))
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local)
-    }
-
-    fn may_fragment(&self) -> bool {
-        false
-    }
 }
 
-#[derive(Debug)]
-struct AlwaysWritable;
-
-impl UdpPoller for AlwaysWritable {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+impl UdpSender for YggUdpSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(self.get_mut().send(transmit))
     }
 }
 
