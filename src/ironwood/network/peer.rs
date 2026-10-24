@@ -13,6 +13,7 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, sync::Notify};
 use tokio_util::{io::SyncIoBridge, sync::CancellationToken};
+use tracing::{debug, trace};
 
 use crate::ironwood::{
     errors::Error,
@@ -203,6 +204,20 @@ pub enum InFrame {
     Traffic(Box<Traffic>),
 }
 
+const fn frame_name(frame: &InFrame) -> &'static str {
+    match frame {
+        InFrame::KeepAlive => "keepalive",
+        InFrame::SigReq(_) => "sig_req",
+        InFrame::SigRes(_) => "sig_res",
+        InFrame::Announce(_) => "announce",
+        InFrame::Bloom(_) => "bloom",
+        InFrame::PathLookup(_) => "path_lookup",
+        InFrame::PathNotify(_) => "path_notify",
+        InFrame::PathBroken(_) => "path_broken",
+        InFrame::Traffic(_) => "traffic",
+    }
+}
+
 /// `PacketDispatcher` — обработчик пришедших фреймов.
 /// `Send` — чтобы `dyn PacketDispatcher` можно было тащить в `spawn_blocking`.
 pub trait PacketDispatcher: Send {
@@ -282,6 +297,11 @@ pub fn session_loop(
         let Some(frame) = decode_one_frame(conn, max_frame)? else {
             return Ok(());
         };
+        trace!(
+            peer = %crate::config::hex(peer.key().as_bytes()),
+            kind = frame_name(&frame),
+            "peer: frame received"
+        );
         dispatcher.dispatch(peer, frame)?;
     }
 }
@@ -302,10 +322,20 @@ pub fn session_loop_sync(
         // Слить отправленное.
         while let Some(frame) = peer.try_pop() {
             let bytes = encode_frame(&frame)?;
+            trace!(
+                peer = %crate::config::hex(peer.key.as_bytes()),
+                kind = ?frame.wire_type(),
+                bytes = bytes.len(),
+                "peer: sync frame sent"
+            );
             conn.write_all(&bytes).map_err(|_| Error::ENCODE)?;
         }
         // Прочитать следующий фрейм.
         let Some(frame) = decode_one_frame(conn, max_frame)? else {
+            debug!(
+                peer = %crate::config::hex(peer.key.as_bytes()),
+                "peer: sync loop EOF"
+            );
             // EOF: последняя best-effort попытка слить хвост.
             while let Some(frame) = peer.try_pop() {
                 if let Ok(bytes) = encode_frame(&frame) {
@@ -314,6 +344,11 @@ pub fn session_loop_sync(
             }
             return Ok(());
         };
+        trace!(
+            peer = %crate::config::hex(peer.key.as_bytes()),
+            kind = frame_name(&frame),
+            "peer: sync frame received"
+        );
         dispatcher.dispatch(peer, frame)?;
     }
 }
@@ -344,6 +379,8 @@ pub fn spawn_peer(
     external_shutdown: &CancellationToken,
 ) -> (Arc<Peer>, tokio::task::JoinHandle<()>) {
     let peer = Arc::new(Peer::new(key, port, prio, order));
+    let peer_hex = crate::config::hex(key.as_bytes());
+    debug!(peer = %peer_hex, port, prio, order, "peer: session started");
     let shutdown = external_shutdown.child_token();
 
     let (read_half, write_half): SplitConn = tokio::io::split(conn);
@@ -354,6 +391,7 @@ pub fn spawn_peer(
     {
         let peer_w = Arc::clone(&peer);
         let shutdown_w = shutdown.clone();
+        let peer_hex = peer_hex.clone();
         set.spawn(async move {
             let mut wh = write_half;
             loop {
@@ -361,6 +399,12 @@ pub fn spawn_peer(
                     let Ok(bytes) = encode_frame(&frame) else {
                         continue;
                     };
+                    trace!(
+                        peer = %peer_hex,
+                        kind = ?frame.wire_type(),
+                        bytes = bytes.len(),
+                        "peer: frame sent"
+                    );
                     if wh.write_all(&bytes).await.is_err() {
                         shutdown_w.cancel();
                         return;
@@ -418,6 +462,7 @@ pub fn spawn_peer(
             shutdown.cancel();
         }
         while set.join_next().await.is_some() {}
+        debug!(peer = %peer_hex, "peer: session finished");
     });
 
     (peer, handle)

@@ -1,0 +1,162 @@
+#!/bin/bash
+# Rootless s-channel topology smoke test for uu-yggdrasil.
+#
+#   1      5
+#    \    /
+#     3--4
+#    /    \
+#   2      6
+#
+# Links 4<->5 and 4<->6 are shaped to make the two branches independent.
+# The probe starts in node1 and reaches the control listener on node6.
+#
+# Run as a normal user:
+#   misc/run-schannel-netns
+#
+# The script re-execs itself under `unshare -Urnm`; sudo is not required.
+
+set -euo pipefail
+
+SCRIPT=$(readlink -f -- "${BASH_SOURCE[0]}")
+ROOT=$(cd -- "$(dirname -- "$SCRIPT")/.." && pwd)
+
+if [[ "${UU_YGG_NETNS:-}" != "1" ]]; then
+    cd "$ROOT"
+    cargo build --offline --bins
+    exec env UU_YGG_NETNS=1 UU_YGG_ROOT="$ROOT" \
+        unshare -Urnm --fork bash -c '
+            set -euo pipefail
+            mount -t tmpfs tmpfs /run
+            mount -t tmpfs tmpfs /tmp
+            mkdir -p /run/netns
+            script=$1
+            shift
+            exec "$script" "$@"
+        ' bash "$SCRIPT" "$@"
+fi
+
+ROOT=${UU_YGG_ROOT:-$(pwd)}
+BIN="$ROOT/target/debug"
+PEER_PORT=7993
+CONTROL_PORT=4456
+TMP=$(mktemp -d /tmp/uu-ygg-schannel.XXXXXX)
+NAMESPACES=(uu-schannel-1 uu-schannel-2 uu-schannel-3 uu-schannel-4 uu-schannel-5 uu-schannel-6)
+
+cleanup() {
+    set +e
+    kill $(jobs -p) 2>/dev/null
+    wait 2>/dev/null
+    for ns in "${NAMESPACES[@]}"; do
+        ip netns del "$ns" 2>/dev/null
+    done
+    rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+fail() {
+    echo "FAIL: $*" >&2
+    for log in "$TMP"/*.log; do
+        [[ -f "$log" ]] || continue
+        echo "--- $(basename "$log") ---" >&2
+        tail -40 "$log" >&2
+    done
+    exit 1
+}
+
+wait_for_line() {
+    local file=$1 pattern=$2 seconds=${3:-20}
+    for ((i = 0; i < seconds * 10; i++)); do
+        grep -q -- "$pattern" "$file" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    fail "timeout waiting for '$pattern' in $(basename "$file")"
+}
+
+echo "==> creating namespaces"
+for ns in "${NAMESPACES[@]}"; do
+    ip netns add "$ns"
+    ip -n "$ns" link set lo up
+done
+
+add_link() {
+    local a=$1 b=$2 host_a=$3 host_b=$4 addr_a=$5 addr_b=$6
+    ip link add "$host_a" type veth peer name "$host_b"
+    ip link set "$host_a" netns "$a"
+    ip link set "$host_b" netns "$b"
+    ip -n "$a" addr add "$addr_a" dev "$host_a"
+    ip -n "$b" addr add "$addr_b" dev "$host_b"
+    ip -n "$a" link set "$host_a" up
+    ip -n "$b" link set "$host_b" up
+}
+
+echo "==> creating links"
+add_link "${NAMESPACES[0]}" "${NAMESPACES[2]}" veth13 veth31 10.13.0.1/24 10.13.0.3/24
+add_link "${NAMESPACES[1]}" "${NAMESPACES[2]}" veth23 veth32 10.23.0.2/24 10.23.0.3/24
+add_link "${NAMESPACES[2]}" "${NAMESPACES[3]}" veth34 veth43 10.34.0.3/24 10.34.0.4/24
+add_link "${NAMESPACES[3]}" "${NAMESPACES[4]}" veth45 veth54 10.45.0.4/24 10.45.0.5/24
+add_link "${NAMESPACES[3]}" "${NAMESPACES[5]}" veth46 veth64 10.46.0.4/24 10.46.0.6/24
+
+# Optional shaping from the original Go test.
+ip netns exec "${NAMESPACES[3]}" tc qdisc add dev veth45 root tbf rate 100mbit burst 8192 latency 1ms 2>/dev/null || true
+ip netns exec "${NAMESPACES[4]}" tc qdisc add dev veth54 root tbf rate 100mbit burst 8192 latency 1ms 2>/dev/null || true
+ip netns exec "${NAMESPACES[3]}" tc qdisc add dev veth46 root tbf rate 10mbit burst 8192 latency 1ms 2>/dev/null || true
+ip netns exec "${NAMESPACES[5]}" tc qdisc add dev veth64 root tbf rate 10mbit burst 8192 latency 1ms 2>/dev/null || true
+
+echo "==> generating node keys"
+declare -a PRIV KEY
+for i in 1 2 3 4 5 6; do
+    "$BIN/uu-yggdrasil" -g "$TMP/gen$i.toml" >/dev/null
+    PRIV[$i]=$(sed -n 's/^private_key = "\(.*\)"/\1/p' "$TMP/gen$i.toml")
+    KEY[$i]=${PRIV[$i]:64:64}
+done
+
+write_config() {
+    local index=$1 peers=$2
+    cat >"$TMP/node$index.toml" <<EOF
+private_key = "${PRIV[$index]}"
+peers = [
+$peers
+]
+listen = ["tcp://0.0.0.0:$PEER_PORT"]
+if_name = "none"
+EOF
+}
+
+write_config 1 "  \"tcp://10.13.0.3:$PEER_PORT?key=${KEY[3]}\","
+write_config 2 "  \"tcp://10.23.0.3:$PEER_PORT?key=${KEY[3]}\","
+write_config 3 "  \"tcp://10.13.0.1:$PEER_PORT?key=${KEY[1]}\",
+  \"tcp://10.23.0.2:$PEER_PORT?key=${KEY[2]}\",
+  \"tcp://10.34.0.4:$PEER_PORT?key=${KEY[4]}\","
+write_config 4 "  \"tcp://10.34.0.3:$PEER_PORT?key=${KEY[3]}\",
+  \"tcp://10.45.0.5:$PEER_PORT?key=${KEY[5]}\",
+  \"tcp://10.46.0.6:$PEER_PORT?key=${KEY[6]}\","
+write_config 5 "  \"tcp://10.45.0.4:$PEER_PORT?key=${KEY[4]}\","
+write_config 6 "  \"tcp://10.46.0.4:$PEER_PORT?key=${KEY[4]}\","
+
+echo "==> starting nodes"
+for i in 1 2 3 4 5; do
+    ip netns exec "${NAMESPACES[$((i - 1))]}" "$BIN/daemon" \
+        -c "$TMP/node$i.toml" --no-tun >"$TMP/node$i.log" 2>&1 &
+done
+ip netns exec "${NAMESPACES[5]}" "$BIN/control" \
+    -c "$TMP/node6.toml" --control-port "$CONTROL_PORT" >"$TMP/node6.log" 2>&1 &
+
+for i in 1 2 3 4 5 6; do
+    wait_for_line "$TMP/node$i.log" "running; press Ctrl-C"
+done
+wait_for_line "$TMP/node6.log" "address: "
+ADDR6=$(sed -n 's/^address: //p' "$TMP/node6.log" | head -1)
+[[ -n "$ADDR6" ]] || fail "node6 address is missing"
+
+echo "==> node6=$ADDR6"
+echo "==> probing node1 -> node3 -> node4 -> node6:$CONTROL_PORT"
+
+timeout 90s ip netns exec "${NAMESPACES[0]}" "$BIN/probe" \
+    "127.0.0.1:$PEER_PORT" "${KEY[6]}" "$ADDR6" "$CONTROL_PORT" \
+    >"$TMP/probe.log" 2>&1 || true
+
+if ! grep -q "SYN-ACK; GET sent" "$TMP/probe.log"; then
+    fail "probe did not receive SYN-ACK"
+fi
+
+echo "PASS: s-channel overlay is reachable"

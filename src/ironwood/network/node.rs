@@ -5,12 +5,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, trace};
 
 use crate::ironwood::encrypted::{
     crypto::GroupAuth,
@@ -124,6 +124,12 @@ impl Ironwood {
     }
     /// Положить расшифрованный payload в приёмную очередь.
     fn push_payload(&self, from: PublicKey, payload: Vec<u8>) {
+        trace!(
+            from = %crate::config::hex(from.as_bytes()),
+            bytes = payload.len(),
+            proto = payload.first().copied(),
+            "node: payload queued"
+        );
         let tr = Traffic {
             path: Vec::new(),
             from: Vec::new(),
@@ -161,6 +167,11 @@ impl Ironwood {
         for event in events {
             match event {
                 SessionEvent::Deliver { from, payload } => {
+                    trace!(
+                        from = %crate::config::hex(from.as_bytes()),
+                        bytes = payload.len(),
+                        "node: encrypted payload delivered"
+                    );
                     // typeSessionProto = 2; всё остальное — IPv6-трафик.
                     if payload.first() == Some(&2) {
                         self.proto_lock().push_back((from, payload));
@@ -170,6 +181,11 @@ impl Ironwood {
                     }
                 }
                 SessionEvent::Send { dest, data } => {
+                    trace!(
+                        dest = %crate::config::hex(dest.as_bytes()),
+                        bytes = data.len(),
+                        "node: encrypted payload send"
+                    );
                     let _ = self.send_base_now(dest, data, false);
                 }
             }
@@ -179,6 +195,23 @@ impl Ironwood {
     /// Общая логика dispatch. `IronwoodDispatcher` и `IronwoodDispatcherRef`
     /// делегируют сюда.
     fn dispatch_impl(&self, peer: &dyn PeerHandle, frame: InFrame) -> Result<(), Error> {
+        let peer_key = peer.key();
+        let frame_kind = match &frame {
+            InFrame::KeepAlive => "keepalive",
+            InFrame::SigReq(_) => "sig_req",
+            InFrame::SigRes(_) => "sig_res",
+            InFrame::Announce(_) => "announce",
+            InFrame::Bloom(_) => "bloom",
+            InFrame::PathLookup(_) => "path_lookup",
+            InFrame::PathNotify(_) => "path_notify",
+            InFrame::PathBroken(_) => "path_broken",
+            InFrame::Traffic(_) => "traffic",
+        };
+        trace!(
+            peer = %crate::config::hex(peer_key.as_bytes()),
+            kind = frame_kind,
+            "node: dispatch"
+        );
         match frame {
             InFrame::Bloom(b) => {
                 self.router_lock().handle_bloom(peer, &b);
@@ -189,11 +222,7 @@ impl Ironwood {
                 self.router_lock().handle_request(peer, &req);
                 Ok(())
             }
-            InFrame::SigRes(res) => {
-                // RTT сейчас ZERO; измерение — следующий шаг (в `Peer`).
-                self.router_lock()
-                    .handle_response(peer, &res, Duration::ZERO)
-            }
+            InFrame::SigRes(res) => self.router_lock().handle_response(peer, &res),
             InFrame::Announce(ann) => self.router_lock().handle_announce(peer, &ann),
             InFrame::PathLookup(lookup) => {
                 let mut pf = self.pathfinder_lock();
@@ -328,17 +357,32 @@ impl Ironwood {
     /// Зарегистрировать свежего `Peer`. `handle` — `Arc<dyn PeerHandle>`,
     /// `peer` — конкретный тип (нужен `Peers::add`).
     fn register_peer(&self, peer: &Arc<Peer>, handle: &Arc<dyn PeerHandle>) {
+        debug!(
+            peer = %crate::config::hex(peer.key.as_bytes()),
+            port = peer.port,
+            "node: register peer"
+        );
         self.peers_lock().add(Arc::clone(peer));
         self.router_lock().add_peer(handle);
     }
 
     fn unregister_peer(&self, peer: &Arc<Peer>, handle: &Arc<dyn PeerHandle>) {
+        debug!(
+            peer = %crate::config::hex(peer.key.as_bytes()),
+            "node: unregister peer"
+        );
         self.router_lock().remove_peer(handle);
         self.peers_lock().remove(peer);
     }
     /// Отправить уже сформированный `Traffic` через pathfinder (base-слой).
     /// Возвращает `false`, если путь неизвестен и пакет отложен.
     fn send_base_now(&self, dest: PublicKey, payload: Vec<u8>, empty_path: bool) -> bool {
+        trace!(
+            dest = %crate::config::hex(dest.as_bytes()),
+            bytes = payload.len(),
+            empty_path,
+            "node: base send"
+        );
         let tr = Traffic {
             path: Vec::new(),
             from: Vec::new(),
@@ -366,6 +410,10 @@ impl Ironwood {
                         tr.path = path;
                         tr.from = from;
                     }
+                    trace!(
+                        dest = %crate::config::hex(dest.as_bytes()),
+                        "node: direct peer send"
+                    );
                     peer.send_traffic(tr);
                     return true;
                 }
@@ -436,6 +484,11 @@ impl PacketConnBase for Ironwood {
     }
 
     async fn send_to(&self, buf: &[u8], addr: &KeyAddr) -> io::Result<usize> {
+        trace!(
+            dest = %crate::config::hex(addr.as_key().as_bytes()),
+            bytes = buf.len(),
+            "node: encrypted send"
+        );
         if self.closed.load(Ordering::SeqCst) {
             return Err(io::Error::other("closed"));
         }
@@ -449,6 +502,11 @@ impl PacketConnBase for Ironwood {
         for event in events {
             match event {
                 SessionEvent::Send { dest, data } => {
+                    trace!(
+                        dest = %crate::config::hex(dest.as_bytes()),
+                        bytes = data.len(),
+                        "node: encrypted payload send"
+                    );
                     let _ = self.send_base_now(dest, data, false);
                 }
                 SessionEvent::Deliver { from, payload } => self.push_payload(from, payload),
@@ -505,6 +563,13 @@ impl PacketConnTrait for Ironwood {
             (peers.port_for(key), peers.allocate_order())
         };
 
+        debug!(
+            peer = %crate::config::hex(key.as_bytes()),
+            port,
+            prio,
+            order,
+            "node: sync peer accepted"
+        );
         let peer = Arc::new(Peer::new(*key, port, prio, order));
         let handle: Arc<dyn PeerHandle> = peer.clone();
         self.register_peer(&peer, &handle);
@@ -595,6 +660,13 @@ pub async fn spawn_conn(
     let dispatcher = Box::new(IronwoodDispatcher {
         node: Arc::clone(&node),
     });
+    debug!(
+        peer = %crate::config::hex(key.as_bytes()),
+        port,
+        prio,
+        order,
+        "node: async peer accepted"
+    );
     let (peer, handle) = spawn_peer(
         key,
         port,
@@ -614,4 +686,79 @@ pub async fn spawn_conn(
 
     node.unregister_peer(&peer, &dyn_handle);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    async fn wait_for_peers(a: &Arc<Ironwood>, b: &Arc<Ironwood>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while a.peer_count() != 1 || b.peer_count() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peers did not connect");
+    }
+
+    /// Регрессия из статьи Revertron: RTT нельзя измерять от момента
+    /// подключения к пиру. Иначе с возрастом соединения задержка растёт
+    /// линейно, и router начинает перестраивать дерево.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtt_does_not_grow_with_connection_age() {
+        let key_a = SigningKey::from_bytes(&[0x11; 32]);
+        let key_b = SigningKey::from_bytes(&[0x22; 32]);
+        let config = Config::default()
+            .with_router_refresh(Duration::from_millis(25))
+            .with_peer_keep_alive_delay(Duration::from_millis(200))
+            .with_peer_timeout(Duration::from_secs(2));
+        let a = Ironwood::new(&key_a, config.clone()).expect("node a");
+        let b = Ironwood::new(&key_b, config).expect("node b");
+        let a_key = *a.crypto.public_key();
+        let b_key = *b.crypto.public_key();
+
+        // UnixStream, а не duplex: тесту нужен способ принудительно
+        // разбудить блокирующие reader-задачи при завершении.
+        let (socket_a, socket_b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        socket_a.set_nonblocking(true).expect("nonblocking a");
+        socket_b.set_nonblocking(true).expect("nonblocking b");
+        let closer_a = socket_a.try_clone().expect("clone a");
+        let closer_b = socket_b.try_clone().expect("clone b");
+        let stream_a = tokio::net::UnixStream::from_std(socket_a).expect("tokio a");
+        let stream_b = tokio::net::UnixStream::from_std(socket_b).expect("tokio b");
+        let task_a = tokio::spawn(spawn_conn(Arc::clone(&a), b_key, Box::new(stream_a), 0));
+        let task_b = tokio::spawn(spawn_conn(Arc::clone(&b), a_key, Box::new(stream_b), 0));
+        wait_for_peers(&a, &b).await;
+
+        // Несколько циклов SigReq/SigRes за заметное время. При баге
+        // «время с момента подключения» lag успевает вырасти экспоненциально.
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(1200) {
+            a.do_maintenance();
+            b.do_maintenance();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let lag = a.router_lock().lag(&b_key).expect("peer lag");
+        assert!(
+            lag < Duration::from_millis(200),
+            "RTT must be measured per SigReq, not from connection start; lag={lag:?}"
+        );
+
+        a.close().expect("close a");
+        b.close().expect("close b");
+        closer_a
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shutdown a");
+        closer_b
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shutdown b");
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = tokio::join!(task_a, task_b);
+        })
+        .await;
+    }
 }

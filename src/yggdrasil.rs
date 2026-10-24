@@ -63,6 +63,7 @@ use tokio::{
     time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, trace};
 
 pub use tokio::net::{TcpStream, UdpSocket};
 
@@ -181,6 +182,32 @@ pub(crate) struct Inner {
     shutdown: CancellationToken,
 }
 
+impl Inner {
+    pub(crate) const fn node(&self) -> &Arc<Ironwood> {
+        &self.node
+    }
+
+    pub(crate) const fn secret(&self) -> &SigningKey {
+        &self.secret
+    }
+
+    pub(crate) const fn key(&self) -> PublicKey {
+        self.key
+    }
+
+    pub(crate) const fn address(&self) -> Address {
+        self.address
+    }
+
+    pub(crate) const fn addr_to_key(&self) -> &Arc<RwLock<HashMap<Address, PublicKey>>> {
+        &self.addr_to_key
+    }
+
+    pub(crate) const fn shutdown_token(&self) -> &CancellationToken {
+        &self.shutdown
+    }
+}
+
 impl Yggdrasil {
     /// Создать узел. Если `config.tun` задан, интерфейс создаётся сразу;
     /// для этого нужны `root/CAP_NET_ADMIN`.
@@ -203,6 +230,11 @@ impl Yggdrasil {
             old_notify(k);
         });
 
+        debug!(
+            key = %hex(key.as_bytes()),
+            address = %Ipv6Addr::from(address),
+            "yggdrasil: node starting"
+        );
         let node = Ironwood::new(&config.private_key, config.network)
             .map_err(|e| io::Error::other(format!("ironwood init: {e:?}")))?;
 
@@ -415,6 +447,7 @@ impl Yggdrasil {
     /// Порт `0`, порт уже занят внутри этого узла, включён TUN или стек не
     /// запустился.
     pub async fn tcp_listen(&self, port: u16) -> io::Result<YggTcpListener> {
+        debug!(port, address = %self.address(), "yggdrasil: TCP listen");
         if port == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -444,8 +477,17 @@ impl Yggdrasil {
                 "TCP port must not be zero",
             ));
         }
-        self.inner.ensure_key(ip).await?;
-        self.inner.start_inproc()?.tcp_connect(ip, port).await
+        let key = self.inner.ensure_key(ip).await?;
+        debug!(
+            dest = %ip,
+            port,
+            key = %hex(key.as_bytes()),
+            "yggdrasil: TCP connect"
+        );
+        self.inner
+            .start_inproc()?
+            .tcp_connect(ip, port, Some(key))
+            .await
     }
 
     /// Слушать UDP-порт внутри yggdrasil, не занимая порт ОС.
@@ -454,6 +496,7 @@ impl Yggdrasil {
     /// Порт `0`, порт уже занят внутри этого узла, включён TUN или стек не
     /// запустился.
     pub async fn udp_bind(&self, port: u16) -> io::Result<YggUdpSocket> {
+        debug!(port, address = %self.address(), "yggdrasil: UDP bind");
         if port == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -464,6 +507,17 @@ impl Yggdrasil {
             .start_inproc()?
             .udp_bind(port, Arc::clone(&self.inner))
             .await
+    }
+
+    /// Создать QUIC-транспорт поверх yggdrasil-сети.
+    ///
+    /// Транспорт использует тот же узел, что и [`Self::tcp_listen`]/[`Self::udp_bind`],
+    /// но не занимает порт ОС.
+    ///
+    /// # Errors
+    /// Ошибка создания TLS-сертификата или QUIC-endpoint'а.
+    pub fn quic(&self) -> io::Result<crate::quic::YggdrasilQuic> {
+        crate::quic::YggdrasilQuic::new(&self.inner)
     }
 
     /// Открыть TCP-соединение внутри yggdrasil-сети.
@@ -694,6 +748,7 @@ impl Inner {
         if let Some(engine) = current.as_ref() {
             return Ok(engine.clone());
         }
+        debug!(address = %Ipv6Addr::from(self.address), "yggdrasil: starting in-process stack");
         let (engine, tasks) = Engine::start(
             Arc::clone(&self.node),
             self.address,
@@ -718,8 +773,14 @@ impl Inner {
             .get(&addr)
             .copied();
         if let Some(key) = mapped {
+            trace!(
+                ip = %ip,
+                key = %hex(key.as_bytes()),
+                "yggdrasil: address already mapped"
+            );
             return Ok(key);
         }
+        debug!(ip = %ip, "yggdrasil: path lookup for address");
         let partial = addr_get_key(&addr);
         let deadline = Instant::now() + LOOKUP_TIMEOUT;
         loop {
@@ -732,8 +793,14 @@ impl Inner {
                 .get(&addr)
                 .copied();
             if let Some(key) = mapped {
+                debug!(
+                    ip = %ip,
+                    key = %hex(key.as_bytes()),
+                    "yggdrasil: address resolved"
+                );
                 return Ok(key);
             }
+            trace!(ip = %ip, "yggdrasil: address not resolved yet, retrying lookup");
             let retry_at = (Instant::now() + Duration::from_millis(500)).min(deadline);
             if timeout_at(retry_at, notified).await.is_err() && Instant::now() >= deadline {
                 return Err(io::Error::new(
@@ -1217,11 +1284,15 @@ mod live_tests {
             .await
             .expect("connect timeout")
             .expect("connect");
-        let (mut server, peer) = timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .expect("accept timeout")
-            .expect("accept");
+        assert_eq!(client.peer_key(), Some(a.public_key()));
+        let (mut server, peer, peer_key) =
+            timeout(Duration::from_secs(5), listener.accept_with_key())
+                .await
+                .expect("accept timeout")
+                .expect("accept");
         assert_eq!(peer, client.local_addr());
+        assert_eq!(peer_key, Some(b.public_key()));
+        assert_eq!(server.peer_key(), Some(b.public_key()));
         assert_eq!(server.peer_addr().ip(), IpAddr::V6(b.address()));
 
         client.write_all(b"ping").await.unwrap();
@@ -1253,20 +1324,22 @@ mod live_tests {
         assert_eq!(b_socket.send_to(b"hello", dest).await.unwrap(), 5);
 
         let mut buf = [0u8; 32];
-        let (n, from) = timeout(Duration::from_secs(5), a_socket.recv_from(&mut buf))
+        let (n, from, from_key) = timeout(Duration::from_secs(5), a_socket.recv_from_key(&mut buf))
             .await
             .expect("recv timeout")
             .unwrap();
         assert_eq!(&buf[..n], b"hello");
         assert_eq!(from, SocketAddr::new(IpAddr::V6(b.address()), b_port));
+        assert_eq!(from_key, Some(b.public_key()));
 
         a_socket.send_to(b"world", from).await.unwrap();
-        let (n, from) = timeout(Duration::from_secs(5), b_socket.recv_from(&mut buf))
+        let (n, from, from_key) = timeout(Duration::from_secs(5), b_socket.recv_from_key(&mut buf))
             .await
             .expect("recv timeout")
             .unwrap();
         assert_eq!(&buf[..n], b"world");
         assert_eq!(from, dest);
+        assert_eq!(from_key, Some(a.public_key()));
         a.close();
         b.close();
     }

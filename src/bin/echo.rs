@@ -30,6 +30,7 @@ const UDP_BUFFER: usize = 65_535;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    uu_yggdrasil::init_tracing();
     let args = EchoCli::parse();
     if args.generate.run()? {
         return Ok(());

@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tracing::{debug, trace};
 pub use types::{RouterAnnounce, RouterInfo, RouterSigReq, RouterSigRes};
 
 /// `time.Duration(^uint32(0))` из Go — задержка ещё не замерена.
@@ -89,6 +90,7 @@ pub struct Router {
     peers: HashMap<PublicKey, Vec<PeerEntry>>,
     lags: HashMap<usize, Duration>,
     requests: HashMap<PublicKey, RouterSigReq>,
+    sig_req_sent_at: HashMap<usize, Instant>,
     responses: HashMap<PublicKey, RouterSigRes>,
     responded: HashSet<usize>,
     sent: HashMap<PublicKey, HashSet<PublicKey>>,
@@ -112,6 +114,7 @@ impl Router {
             peers: HashMap::new(),
             lags: HashMap::new(),
             requests: HashMap::new(),
+            sig_req_sent_at: HashMap::new(),
             responses: HashMap::new(),
             responded: HashSet::new(),
             sent: HashMap::new(),
@@ -145,6 +148,13 @@ impl Router {
             .get(key)
             .and_then(|v| v.iter().min_by_key(|e| e.handle.prio()))
             .map(|e| Arc::clone(&e.handle))
+    }
+
+    /// Текущая сглаженная задержка прямого пира (диагностика).
+    #[must_use]
+    pub fn lag(&self, key: &PublicKey) -> Option<Duration> {
+        let handle = self.best_peer_for(key)?;
+        self.lags.get(&peer_identity(handle.as_ref())).copied()
     }
 
     /// Периодическое обслуживание (Go `_doMaintenance`): сброс кэша,
@@ -263,6 +273,12 @@ impl Router {
                 && best_root != self_key
                 && self.use_response(best_parent, &res)
             {
+                debug!(
+                    parent = %crate::config::hex(best_parent.as_bytes()),
+                    root = %crate::config::hex(best_root.as_bytes()),
+                    cost = best_cost,
+                    "router: parent selected"
+                );
                 self.refresh = false;
                 self.do_root1 = false;
                 self.do_root2 = false;
@@ -295,9 +311,14 @@ impl Router {
     }
 
     fn send_reqs(&mut self) {
+        self.send_reqs_at(Instant::now());
+    }
+
+    fn send_reqs_at(&mut self, now: Instant) {
         self.requests.clear();
         self.responses.clear();
         let keys: Vec<PublicKey> = self.peers.keys().copied().collect();
+        debug!(peers = keys.len(), "router: sending SigReq round");
         for key in keys {
             let req = self.new_req();
             self.requests.insert(key, req);
@@ -307,6 +328,13 @@ impl Router {
                 .map_or_default(|v| v.iter().map(|e| Arc::clone(&e.handle)).collect());
             for p in peers {
                 self.responded.remove(&arc_identity(&p));
+                self.sig_req_sent_at.insert(arc_identity(&p), now);
+                trace!(
+                    peer = %crate::config::hex(key.as_bytes()),
+                    seq = req.seq,
+                    nonce = req.nonce,
+                    "router: SigReq -> peer"
+                );
                 p.send_sig_req(&req);
             }
         }
@@ -472,16 +500,34 @@ impl Router {
         &mut self,
         peer: &dyn PeerHandle,
         res: &RouterSigRes,
-        rtt: Duration,
+    ) -> Result<(), Error> {
+        self.handle_response_at(peer, res, Instant::now())
+    }
+
+    fn handle_response_at(
+        &mut self,
+        peer: &dyn PeerHandle,
+        res: &RouterSigRes,
+        now: Instant,
     ) -> Result<(), Error> {
         let self_key = *self.crypto.public_key();
         let peer_key = peer.key();
         if !res.check(&self_key, &peer_key) {
+            debug!(
+                peer = %crate::config::hex(peer_key.as_bytes()),
+                "router: SigRes signature rejected"
+            );
             return Err(Error::BAD_MESSAGE);
         }
 
         let key = peer_key;
         let peer_id = peer_identity(peer);
+        trace!(
+            peer = %crate::config::hex(key.as_bytes()),
+            seq = res.req.seq,
+            nonce = res.req.nonce,
+            "router: SigRes <- peer"
+        );
 
         if !self.responses.contains_key(&key)
             && let Some(our_req) = self.requests.get(&key)
@@ -492,8 +538,10 @@ impl Router {
 
         if let Some(our_req) = self.requests.get(&key)
             && *our_req == res.req
+            && let Some(sent_at) = self.sig_req_sent_at.get(&peer_id).copied()
             && self.responded.insert(peer_id)
         {
+            let rtt = now.saturating_duration_since(sent_at);
             let lag = self
                 .lags
                 .get(&peer_id)
@@ -506,6 +554,19 @@ impl Router {
                 lag * 7 / 8 + rtt.min(prev * 2) / 8
             };
             self.lags.insert(peer_id, next);
+            trace!(
+                peer = %crate::config::hex(key.as_bytes()),
+                rtt_us = rtt.as_micros(),
+                lag_us = next.as_micros(),
+                "router: RTT sample"
+            );
+        } else {
+            trace!(
+                peer = %crate::config::hex(key.as_bytes()),
+                seq = res.req.seq,
+                nonce = res.req.nonce,
+                "router: stale or duplicate SigRes ignored"
+            );
         }
         Ok(())
     }
@@ -549,6 +610,13 @@ impl Router {
     /// `ProtoTraffic`: маршрутизация + `watermark`-обновление.
     pub fn handle_traffic(&mut self, mut tr: Traffic) -> TrafficAction {
         let self_key = *self.crypto.public_key();
+        trace!(
+            source = %crate::config::hex(tr.source.as_bytes()),
+            dest = %crate::config::hex(tr.dest.as_bytes()),
+            bytes = tr.payload.len(),
+            path = tr.path.len(),
+            "router: traffic"
+        );
         // Трафик, адресованный нам, всегда доставляем локально: даже с
         // пустым `path` (прямой пир) lookup не должен отправить его обратно.
         if tr.dest == self_key {
@@ -576,6 +644,10 @@ impl Router {
 
     /// `add_peer`: регистрирует сессию. `true` — ключ новый.
     pub fn add_peer(&mut self, peer: &Arc<dyn PeerHandle>) -> bool {
+        self.add_peer_at(peer, Instant::now())
+    }
+
+    fn add_peer_at(&mut self, peer: &Arc<dyn PeerHandle>, now: Instant) -> bool {
         let key = peer.key();
         let peer_id = arc_identity(peer);
         let is_new = !self.peers.contains_key(&key);
@@ -584,6 +656,12 @@ impl Router {
             handle: Arc::clone(peer),
         });
         self.lags.insert(peer_id, ROUTER_UNKNOWN_LATENCY);
+        debug!(
+            peer = %crate::config::hex(key.as_bytes()),
+            is_new,
+            peers = self.peers.get(&key).map_or(0, Vec::len),
+            "router: peer added"
+        );
 
         if is_new {
             self.sent.insert(key, HashSet::new());
@@ -606,6 +684,7 @@ impl Router {
         }
         let req = self.requests[&key];
         self.responded.remove(&peer_id);
+        self.sig_req_sent_at.insert(peer_id, now);
         peer.send_sig_req(&req);
 
         is_new
@@ -641,7 +720,13 @@ impl Router {
             }
         }
         self.lags.remove(&peer_id);
+        self.sig_req_sent_at.remove(&peer_id);
         self.responded.remove(&peer_id);
+        debug!(
+            peer = %crate::config::hex(key.as_bytes()),
+            remaining = self.peers.get(&key).map_or(0, Vec::len),
+            "router: peer removed"
+        );
     }
 
     pub fn iter_peers(&self) -> impl Iterator<Item = &Arc<dyn PeerHandle>> {
@@ -955,5 +1040,228 @@ impl Router {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ironwood::network::{peer::OutFrame, wire::PeerPort};
+    use ed25519_dalek::{Signature, Signer, SigningKey};
+    use std::sync::Mutex;
+
+    struct TestPeer {
+        key: PublicKey,
+        port: PeerPort,
+        prio: u8,
+        order: u64,
+        sent: Mutex<Vec<OutFrame>>,
+    }
+
+    impl TestPeer {
+        fn new(key: PublicKey, port: PeerPort, order: u64) -> Arc<Self> {
+            Arc::new(Self {
+                key,
+                port,
+                prio: 0,
+                order,
+                sent: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn take_sig_reqs(&self) -> Vec<RouterSigReq> {
+            let mut sent = self.sent.lock().expect("lock");
+            let mut reqs = Vec::new();
+            sent.retain(|frame| {
+                if let OutFrame::SigReq(req) = frame {
+                    reqs.push(*req);
+                    false
+                } else {
+                    true
+                }
+            });
+            reqs
+        }
+    }
+
+    impl PeerHandle for TestPeer {
+        fn key(&self) -> PublicKey {
+            self.key
+        }
+
+        fn port(&self) -> PeerPort {
+            self.port
+        }
+
+        fn prio(&self) -> u8 {
+            self.prio
+        }
+
+        fn order(&self) -> u64 {
+            self.order
+        }
+
+        fn send(&self, frame: OutFrame) {
+            self.sent.lock().expect("lock").push(frame);
+        }
+    }
+
+    fn test_router() -> (Router, SigningKey) {
+        let node_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let peer_sk = SigningKey::from_bytes(&[2u8; 32]);
+        let crypto = Arc::new(Crypto::from_signing_key(node_sk));
+        let router = Router::new(crypto, Config::default());
+        (router, peer_sk)
+    }
+
+    fn peer_handle(peer: &Arc<TestPeer>) -> Arc<dyn PeerHandle> {
+        peer.clone()
+    }
+
+    fn signed_response(
+        router: &Router,
+        peer_sk: &SigningKey,
+        req: RouterSigReq,
+        port: PeerPort,
+    ) -> RouterSigRes {
+        let node = *router.crypto.public_key();
+        let parent = peer_sk.verifying_key();
+        let placeholder = RouterSigRes {
+            req,
+            port,
+            psig: Signature::from_bytes(&[0u8; 64]),
+        };
+        let psig = peer_sk.sign(&placeholder.bytes_for_sig(&node, &parent));
+        RouterSigRes {
+            psig,
+            ..placeholder
+        }
+    }
+
+    #[test]
+    fn rtt_uses_each_requests_send_time() {
+        let (mut router, peer_sk) = test_router();
+        let peer = TestPeer::new(peer_sk.verifying_key(), 7, 0);
+        let handle = peer_handle(&peer);
+        let peer_id = peer_identity(handle.as_ref());
+        let t0 = Instant::now();
+
+        router.add_peer_at(&handle, t0);
+        let first_request = peer.take_sig_reqs().pop().expect("sig req");
+        assert_eq!(router.sig_req_sent_at.get(&peer_id), Some(&t0));
+
+        let first_response = signed_response(&router, &peer_sk, first_request, 7);
+        router
+            .handle_response_at(
+                handle.as_ref(),
+                &first_response,
+                t0 + Duration::from_millis(100),
+            )
+            .expect("response");
+        assert_eq!(router.lags[&peer_id], Duration::from_millis(200));
+
+        // Следующий запрос уходит сильно позже. RTT должен считаться от него,
+        // а не от момента подключения или первого запроса.
+        let t1 = t0 + Duration::from_secs(3600);
+        router.send_reqs_at(t1);
+        let second_request = peer.take_sig_reqs().pop().expect("sig req");
+        assert_eq!(router.sig_req_sent_at.get(&peer_id), Some(&t1));
+
+        let second_response = signed_response(&router, &peer_sk, second_request, 7);
+        router
+            .handle_response_at(
+                handle.as_ref(),
+                &second_response,
+                t1 + Duration::from_millis(5),
+            )
+            .expect("response");
+        let lag = router.lags[&peer_id];
+        assert!(
+            lag >= Duration::from_millis(175) && lag < Duration::from_millis(200),
+            "RTT must not include the hour between requests: {lag:?}"
+        );
+    }
+
+    #[test]
+    fn rtt_is_tracked_per_connection() {
+        let (mut router, peer_sk) = test_router();
+        let peer_a = TestPeer::new(peer_sk.verifying_key(), 7, 0);
+        let peer_b = TestPeer::new(peer_sk.verifying_key(), 8, 1);
+        let handle_a = peer_handle(&peer_a);
+        let handle_b = peer_handle(&peer_b);
+        let t0 = Instant::now();
+
+        router.add_peer_at(&handle_a, t0);
+        let request_a = peer_a.take_sig_reqs().pop().expect("sig req");
+        router.add_peer_at(&handle_b, t0 + Duration::from_secs(10));
+        let request_b = peer_b.take_sig_reqs().pop().expect("sig req");
+        assert_eq!(request_a, request_b);
+
+        let answer_a = signed_response(&router, &peer_sk, request_a, 7);
+        router
+            .handle_response_at(
+                handle_a.as_ref(),
+                &answer_a,
+                t0 + Duration::from_millis(100),
+            )
+            .expect("response");
+        let answer_b = signed_response(&router, &peer_sk, request_b, 8);
+        router
+            .handle_response_at(
+                handle_b.as_ref(),
+                &answer_b,
+                t0 + Duration::from_secs(10) + Duration::from_millis(50),
+            )
+            .expect("response");
+
+        assert_eq!(
+            router.lags[&peer_identity(handle_a.as_ref())],
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            router.lags[&peer_identity(handle_b.as_ref())],
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn stale_response_does_not_update_rtt() {
+        let (mut router, peer_sk) = test_router();
+        let peer = TestPeer::new(peer_sk.verifying_key(), 7, 0);
+        let handle = peer_handle(&peer);
+        let peer_id = peer_identity(handle.as_ref());
+        let t0 = Instant::now();
+
+        router.add_peer_at(&handle, t0);
+        let old_request = peer.take_sig_reqs().pop().expect("sig req");
+        router.send_reqs_at(t0 + Duration::from_secs(30));
+        let _new_req = peer.take_sig_reqs().pop().expect("sig req");
+
+        let old_answer = signed_response(&router, &peer_sk, old_request, 7);
+        router
+            .handle_response_at(handle.as_ref(), &old_answer, t0 + Duration::from_secs(30))
+            .expect("response");
+        assert_eq!(router.lags[&peer_id], ROUTER_UNKNOWN_LATENCY);
+    }
+
+    #[test]
+    fn duplicate_response_does_not_reset_rtt() {
+        let (mut router, peer_sk) = test_router();
+        let peer = TestPeer::new(peer_sk.verifying_key(), 7, 0);
+        let handle = peer_handle(&peer);
+        let peer_id = peer_identity(handle.as_ref());
+        let t0 = Instant::now();
+
+        router.add_peer_at(&handle, t0);
+        let req = peer.take_sig_reqs().pop().expect("sig req");
+        let res = signed_response(&router, &peer_sk, req, 7);
+
+        router
+            .handle_response_at(handle.as_ref(), &res, t0 + Duration::from_millis(100))
+            .expect("response");
+        router
+            .handle_response_at(handle.as_ref(), &res, t0 + Duration::from_secs(5))
+            .expect("response");
+        assert_eq!(router.lags[&peer_id], Duration::from_millis(200));
     }
 }

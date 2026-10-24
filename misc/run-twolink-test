@@ -1,0 +1,154 @@
+#!/bin/bash
+# Rootless two-link smoke test for uu-yggdrasil.
+#
+# Creates two network namespaces connected by two point-to-point links
+# (10.11.0.0/24 and 10.12.0.0/24), starts one node in each namespace and
+# verifies that a probe can reach the control listener on the remote node.
+#
+# Run as a normal user:
+#   misc/run-twolink-test
+#
+# The script re-execs itself under `unshare -Urnm`; sudo is not required.
+
+set -euo pipefail
+
+SCRIPT=$(readlink -f -- "${BASH_SOURCE[0]}")
+ROOT=$(cd -- "$(dirname -- "$SCRIPT")/.." && pwd)
+
+if [[ "${UU_YGG_NETNS:-}" != "1" ]]; then
+    cd "$ROOT"
+    cargo build --offline --bins
+    exec env UU_YGG_NETNS=1 UU_YGG_ROOT="$ROOT" \
+        unshare -Urnm --fork bash -c '
+            set -euo pipefail
+            mount -t tmpfs tmpfs /run
+            mount -t tmpfs tmpfs /tmp
+            mkdir -p /run/netns
+            script=$1
+            shift
+            exec "$script" "$@"
+        ' bash "$SCRIPT" "$@"
+fi
+
+ROOT=${UU_YGG_ROOT:-$(pwd)}
+BIN="$ROOT/target/debug"
+NS1=uu-twolink-1
+NS2=uu-twolink-2
+PEER_PORT=7993
+CONTROL_PORT=4456
+TMP=$(mktemp -d /tmp/uu-ygg-twolink.XXXXXX)
+
+cleanup() {
+    set +e
+    kill $(jobs -p) 2>/dev/null
+    wait 2>/dev/null
+    ip netns del "$NS1" 2>/dev/null
+    ip netns del "$NS2" 2>/dev/null
+    rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+fail() {
+    echo "FAIL: $*" >&2
+    for log in "$TMP"/*.log; do
+        [[ -f "$log" ]] || continue
+        echo "--- $(basename "$log") ---" >&2
+        tail -50 "$log" >&2
+    done
+    exit 1
+}
+
+wait_for_line() {
+    local file=$1 pattern=$2 seconds=${3:-20}
+    for ((i = 0; i < seconds * 10; i++)); do
+        grep -q -- "$pattern" "$file" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    fail "timeout waiting for '$pattern' in $(basename "$file")"
+}
+
+echo "==> creating namespaces and links"
+ip netns add "$NS1"
+ip netns add "$NS2"
+
+ip link add veth11 type veth peer name veth21
+ip link set veth11 netns "$NS1"
+ip link set veth21 netns "$NS2"
+
+ip link add veth12 type veth peer name veth22
+ip link set veth12 netns "$NS1"
+ip link set veth22 netns "$NS2"
+
+ip -n "$NS1" addr add 10.11.0.1/24 dev veth11
+ip -n "$NS2" addr add 10.11.0.2/24 dev veth21
+ip -n "$NS1" addr add 10.12.0.1/24 dev veth12
+ip -n "$NS2" addr add 10.12.0.2/24 dev veth22
+
+for ns in "$NS1" "$NS2"; do
+    ip -n "$ns" link set lo up
+    ip -n "$ns" link set veth11 up 2>/dev/null || true
+    ip -n "$ns" link set veth21 up 2>/dev/null || true
+    ip -n "$ns" link set veth12 up 2>/dev/null || true
+    ip -n "$ns" link set veth22 up 2>/dev/null || true
+done
+
+# Bandwidth shaping is optional: it is not needed for connectivity.
+ip netns exec "$NS1" tc qdisc add dev veth11 root tbf rate 10mbit burst 8192 latency 1ms 2>/dev/null || true
+ip netns exec "$NS2" tc qdisc add dev veth21 root tbf rate 10mbit burst 8192 latency 1ms 2>/dev/null || true
+ip netns exec "$NS1" tc qdisc add dev veth12 root tbf rate 100mbit burst 8192 latency 1ms 2>/dev/null || true
+ip netns exec "$NS2" tc qdisc add dev veth22 root tbf rate 100mbit burst 8192 latency 1ms 2>/dev/null || true
+
+echo "==> generating node keys"
+"$BIN/uu-yggdrasil" -g "$TMP/gen1.toml" >/dev/null
+"$BIN/uu-yggdrasil" -g "$TMP/gen2.toml" >/dev/null
+PRIV1=$(sed -n 's/^private_key = "\(.*\)"/\1/p' "$TMP/gen1.toml")
+PRIV2=$(sed -n 's/^private_key = "\(.*\)"/\1/p' "$TMP/gen2.toml")
+KEY1=${PRIV1:64:64}
+KEY2=${PRIV2:64:64}
+
+cat >"$TMP/node1.toml" <<EOF
+private_key = "$PRIV1"
+peers = [
+  "tcp://10.11.0.2:$PEER_PORT?key=$KEY2&priority=10",
+  "tcp://10.12.0.2:$PEER_PORT?key=$KEY2&priority=1",
+]
+listen = ["tcp://0.0.0.0:$PEER_PORT"]
+if_name = "none"
+EOF
+
+cat >"$TMP/node2.toml" <<EOF
+private_key = "$PRIV2"
+peers = [
+  "tcp://10.11.0.1:$PEER_PORT?key=$KEY1&priority=10",
+  "tcp://10.12.0.1:$PEER_PORT?key=$KEY1&priority=1",
+]
+listen = ["tcp://0.0.0.0:$PEER_PORT"]
+if_name = "none"
+EOF
+
+echo "==> starting nodes"
+ip netns exec "$NS2" "$BIN/control" -c "$TMP/node2.toml" \
+    --control-port "$CONTROL_PORT" >"$TMP/node2.log" 2>&1 &
+ip netns exec "$NS1" "$BIN/daemon" -c "$TMP/node1.toml" --no-tun \
+    >"$TMP/node1.log" 2>&1 &
+
+wait_for_line "$TMP/node1.log" "running; press Ctrl-C"
+wait_for_line "$TMP/node2.log" "running; press Ctrl-C"
+wait_for_line "$TMP/node2.log" "address: "
+
+ADDR2=$(sed -n 's/^address: //p' "$TMP/node2.log" | head -1)
+[[ -n "$ADDR2" ]] || fail "node2 address is missing"
+
+echo "==> node1=$(sed -n 's/^address: //p' "$TMP/node1.log" | head -1)"
+echo "==> node2=$ADDR2"
+echo "==> probe node1 -> node2:$CONTROL_PORT over the overlay"
+
+timeout 70s ip netns exec "$NS1" "$BIN/probe" \
+    "127.0.0.1:$PEER_PORT" "$KEY2" "$ADDR2" "$CONTROL_PORT" \
+    >"$TMP/probe.log" 2>&1 || true
+
+if ! grep -q "SYN-ACK; GET sent" "$TMP/probe.log"; then
+    fail "probe did not receive SYN-ACK"
+fi
+
+echo "PASS: two-link overlay is reachable"

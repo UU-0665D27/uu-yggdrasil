@@ -165,6 +165,7 @@ fn parse_tcp(pkt: &[u8], sport: u16, dport: u16) -> Option<(u8, u32, u32, &[u8])
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    uu_yggdrasil::init_tracing();
     let mut args = std::env::args().skip(1);
     let peer = args.next().unwrap_or_else(|| DEFAULT_PEER.into());
     let dest_hex = args.next().unwrap_or_else(|| DEFAULT_DEST_KEY.into());

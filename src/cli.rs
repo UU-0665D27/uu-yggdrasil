@@ -116,6 +116,7 @@ pub struct ControlCli {
 /// # Errors
 /// Ошибка генерации/записи конфига.
 pub fn run() -> Result<(), Box<dyn Error>> {
+    crate::init_tracing();
     let cli = Cli::parse();
     if cli.generate.run()? {
         return Ok(());

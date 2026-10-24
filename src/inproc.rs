@@ -36,6 +36,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, trace};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -68,9 +69,25 @@ impl YggTcpListener {
     /// # Errors
     /// Пользовательский стек остановлен.
     pub async fn accept(&mut self) -> io::Result<(YggTcpStream, SocketAddr)> {
+        let (stream, peer, _key) = self.accept_with_key().await?;
+        Ok((stream, peer))
+    }
+
+    /// Принять входящее TCP-соединение вместе с публичным ключом отправителя.
+    ///
+    /// Ключ известен, потому что yggdrasil-пакет всегда приходит от конкретного
+    /// узла; `None` возможен только если соответствие адреса и ключа ещё не
+    /// успело попасть во внутреннюю таблицу.
+    ///
+    /// # Errors
+    /// Пользовательский стек остановлен.
+    pub async fn accept_with_key(
+        &mut self,
+    ) -> io::Result<(YggTcpStream, SocketAddr, Option<PublicKey>)> {
         let stream = self.rx.recv().await.ok_or_else(engine_closed)?;
         let peer = stream.peer_addr();
-        Ok((stream, peer))
+        let key = stream.peer_key();
+        Ok((stream, peer, key))
     }
 
     /// Локальный адрес, на котором слушает сервер.
@@ -91,6 +108,7 @@ pub struct YggTcpStream {
     id: u64,
     local: SocketAddr,
     peer: SocketAddr,
+    peer_key: Option<PublicKey>,
     read_rx: mpsc::Receiver<Vec<u8>>,
     pending: Vec<u8>,
     pending_pos: usize,
@@ -103,6 +121,16 @@ impl YggTcpStream {
     #[must_use]
     pub const fn peer_addr(&self) -> SocketAddr {
         self.peer
+    }
+
+    /// Публичный ключ узла, с которым установлено TCP-соединение.
+    ///
+    /// Для входящего соединения это ключ клиента, для исходящего — ключ
+    /// сервера. `None` возможен, только если внутренняя таблица адресов ещё
+    /// не успела получить полный ключ.
+    #[must_use]
+    pub const fn peer_key(&self) -> Option<PublicKey> {
+        self.peer_key
     }
 
     /// Локальный адрес соединения.
@@ -200,7 +228,7 @@ impl AsyncWrite for YggTcpStream {
 pub struct YggUdpSocket {
     id: u64,
     local: SocketAddr,
-    rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    rx: mpsc::Receiver<(Vec<u8>, SocketAddr, Option<PublicKey>)>,
     cmd: mpsc::UnboundedSender<Command>,
     inner: Arc<Inner>,
 }
@@ -217,10 +245,29 @@ impl YggUdpSocket {
     /// # Errors
     /// Пользовательский стек остановлен.
     pub async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (data, addr) = self.rx.recv().await.ok_or_else(engine_closed)?;
+        let (n, addr, _key) = self.recv_from_key(buf).await?;
+        Ok((n, addr))
+    }
+
+    /// Получить датаграмму, адрес и публичный ключ узла-отправителя.
+    ///
+    /// # Errors
+    /// Пользовательский стек остановлен.
+    pub async fn recv_from_key(
+        &mut self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Option<PublicKey>)> {
+        let (data, addr, key) = self.rx.recv().await.ok_or_else(engine_closed)?;
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
-        Ok((n, addr))
+        trace!(
+            local = %self.local,
+            from = %addr,
+            key = key.as_ref().map(|k| crate::config::hex(k.as_bytes())),
+            bytes = n,
+            "inproc: UDP recv"
+        );
+        Ok((n, addr, key))
     }
 
     /// Отправить датаграмму. Перед отправкой выполняется path-lookup адреса.
@@ -240,6 +287,12 @@ impl YggUdpSocket {
                 "UDP datagram is too large",
             ));
         }
+        trace!(
+            local = %self.local,
+            dest = %addr,
+            bytes = buf.len(),
+            "inproc: UDP send"
+        );
         self.inner.ensure_key(ip).await?;
         self.cmd
             .send(Command::UdpSend {
@@ -279,6 +332,10 @@ impl Engine {
             tx: cmd_tx.clone(),
             address: Ipv6Addr::from(address),
         };
+        debug!(
+            address = %engine.address,
+            "inproc: engine starting"
+        );
 
         let pump = {
             let node = Arc::clone(&node);
@@ -298,6 +355,11 @@ impl Engine {
                             }
                             let key = *from.as_key();
                             let addr = addr_for_key(key.as_bytes());
+                            trace!(
+                                key = %crate::config::hex(key.as_bytes()),
+                                overlay_bytes = n,
+                                "inproc: overlay packet received"
+                            );
                             addr_to_key
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -342,11 +404,17 @@ impl Engine {
         })
     }
 
-    pub(crate) async fn tcp_connect(&self, dest: Ipv6Addr, port: u16) -> io::Result<YggTcpStream> {
+    pub(crate) async fn tcp_connect(
+        &self,
+        dest: Ipv6Addr,
+        port: u16,
+        peer_key: Option<PublicKey>,
+    ) -> io::Result<YggTcpStream> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send(Command::TcpConnect {
             dest,
             port,
+            peer_key,
             reply: reply_tx,
         })?;
         timeout(CONNECT_TIMEOUT, reply_rx)
@@ -397,11 +465,12 @@ enum Command {
     TcpConnect {
         dest: Ipv6Addr,
         port: u16,
+        peer_key: Option<PublicKey>,
         reply: oneshot::Sender<io::Result<YggTcpStream>>,
     },
     AddUdp {
         port: u16,
-        rx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+        rx: mpsc::Sender<(Vec<u8>, SocketAddr, Option<PublicKey>)>,
         reply: oneshot::Sender<io::Result<u64>>,
     },
     RemoveUdp {
@@ -437,6 +506,7 @@ struct Conn {
     handle: SocketHandle,
     local: SocketAddr,
     peer: SocketAddr,
+    peer_key: Option<PublicKey>,
     read_tx: Option<mpsc::Sender<Vec<u8>>>,
     read_rx: Option<mpsc::Receiver<Vec<u8>>>,
     connect_reply: Option<oneshot::Sender<io::Result<YggTcpStream>>>,
@@ -450,7 +520,7 @@ struct Conn {
 
 struct UdpState {
     handle: SocketHandle,
-    rx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    rx: mpsc::Sender<(Vec<u8>, SocketAddr, Option<PublicKey>)>,
     write: VecDeque<(IpEndpoint, Vec<u8>)>,
 }
 
@@ -517,6 +587,7 @@ impl State {
     }
 
     async fn run(mut self) {
+        debug!(address = %Ipv6Addr::from(self.address), "inproc: state task started");
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -535,6 +606,7 @@ impl State {
             self.poll();
             self.flush().await;
         }
+        debug!(address = %Ipv6Addr::from(self.address), "inproc: state task stopped");
     }
 
     fn poll(&mut self) {
@@ -583,11 +655,20 @@ impl State {
             };
             let id = self.id();
             let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(self.address)), port);
+            let peer_key = key_for_socket_addr(&self.addr_to_key, remote);
+            debug!(
+                local = %local,
+                peer = %remote,
+                key = peer_key.as_ref().map(|k| crate::config::hex(k.as_bytes())),
+                port,
+                "inproc: TCP accepted"
+            );
             let (read_tx, read_rx) = mpsc::channel(READ_QUEUE);
             let stream = YggTcpStream {
                 id,
                 local,
                 peer: remote,
+                peer_key,
                 read_rx,
                 pending: Vec::new(),
                 pending_pos: 0,
@@ -601,6 +682,7 @@ impl State {
                     handle,
                     local,
                     peer: remote,
+                    peer_key,
                     read_tx: Some(read_tx),
                     read_rx: None,
                     connect_reply: None,
@@ -654,6 +736,7 @@ impl State {
                             id: conn.id,
                             local: conn.local,
                             peer: conn.peer,
+                            peer_key: conn.peer_key,
                             read_rx,
                             pending: Vec::new(),
                             pending_pos: 0,
@@ -735,6 +818,7 @@ impl State {
     }
 
     fn poll_udp(&mut self) {
+        let addr_to_key = Arc::clone(&self.addr_to_key);
         for state in self.udp.values_mut() {
             let socket = self.sockets.get_mut::<udp::Socket>(state.handle);
             while socket.can_recv() {
@@ -742,11 +826,23 @@ impl State {
                     break;
                 };
                 let addr = endpoint_to_socket(meta.endpoint);
-                if state.rx.try_send((data.to_vec(), addr)).is_err() {
+                let key = key_for_socket_addr(addr_to_key.as_ref(), addr);
+                trace!(
+                    from = %addr,
+                    key = key.as_ref().map(|k| crate::config::hex(k.as_bytes())),
+                    bytes = data.len(),
+                    "inproc: UDP datagram"
+                );
+                if state.rx.try_send((data.to_vec(), addr, key)).is_err() {
                     break;
                 }
             }
             while let Some((endpoint, data)) = state.write.front() {
+                trace!(
+                    to = %endpoint_to_socket(*endpoint),
+                    bytes = data.len(),
+                    "inproc: UDP transmit"
+                );
                 if socket.send_slice(data, *endpoint).is_err() {
                     break;
                 }
@@ -773,6 +869,7 @@ impl State {
                         "TCP port is already bound",
                     ))
                 } else {
+                    debug!(port, "inproc: TCP listen");
                     add_listener_socket(&mut self.sockets, port).map(|handle| {
                         let id = self.id();
                         self.listeners.insert(
@@ -795,6 +892,7 @@ impl State {
                 }
             }
             Command::TcpWrite { id, data } => {
+                trace!(id, bytes = data.len(), "inproc: TCP write");
                 if let Some(conn) = self.conns.get_mut(&id) {
                     if conn.write_bytes.saturating_add(data.len()) > WRITE_QUEUE_MAX {
                         conn.close_requested = true;
@@ -809,8 +907,19 @@ impl State {
                     conn.close_requested = true;
                 }
             }
-            Command::TcpConnect { dest, port, reply } => {
-                self.connect(dest, port, reply);
+            Command::TcpConnect {
+                dest,
+                port,
+                peer_key,
+                reply,
+            } => {
+                debug!(
+                    dest = %dest,
+                    port,
+                    key = peer_key.as_ref().map(|k| crate::config::hex(k.as_bytes())),
+                    "inproc: TCP connect"
+                );
+                self.connect(dest, port, peer_key, reply);
             }
             Command::AddUdp { port, rx, reply } => {
                 let result = if self.udp.values().any(|state| {
@@ -825,6 +934,7 @@ impl State {
                         "UDP port is already bound",
                     ))
                 } else {
+                    debug!(port, "inproc: UDP bind");
                     add_udp_socket(&mut self.sockets, port).map(|handle| {
                         let id = self.id();
                         self.udp.insert(
@@ -864,6 +974,7 @@ impl State {
         &mut self,
         dest: Ipv6Addr,
         port: u16,
+        peer_key: Option<PublicKey>,
         reply: oneshot::Sender<io::Result<YggTcpStream>>,
     ) {
         let mut socket = new_tcp_socket();
@@ -891,6 +1002,7 @@ impl State {
                 handle,
                 local,
                 peer: remote,
+                peer_key,
                 read_tx: Some(read_tx),
                 read_rx: Some(read_rx),
                 connect_reply: Some(reply),
@@ -987,6 +1099,20 @@ impl State {
             }
         }
     }
+}
+
+fn key_for_socket_addr(
+    addr_to_key: &RwLock<HashMap<Address, PublicKey>>,
+    addr: SocketAddr,
+) -> Option<PublicKey> {
+    let IpAddr::V6(ip) = addr.ip() else {
+        return None;
+    };
+    addr_to_key
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&ip.octets())
+        .copied()
 }
 
 struct YggDevice {

@@ -28,6 +28,8 @@ crypto_box = { version = "0.9.1", features = ["std"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
@@ -42,5 +44,7 @@ smoltcp = { version = "0.14.0", default-features = false, features = [
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io-util"] }
 toml = "1.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tun = { version = "0.8.14", features = ["async"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }

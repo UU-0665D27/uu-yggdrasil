@@ -22,6 +22,7 @@ use uu_yggdrasil::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    uu_yggdrasil::init_tracing();
     let args = DaemonCli::parse();
     if args.generate.run()? {
         return Ok(());

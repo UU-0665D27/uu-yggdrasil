@@ -40,6 +40,7 @@ commands:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    uu_yggdrasil::init_tracing();
     let args = ControlCli::parse();
     if args.generate.run()? {
         return Ok(());
