@@ -16,14 +16,14 @@ use std::{error::Error, sync::Arc};
 use clap::Parser as _;
 use uu_yggdrasil::{
     Yggdrasil,
-    cli::DaemonCli,
+    cli::ArgsYgg,
     config::{self, LoadedConfig},
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     uu_yggdrasil::init_tracing();
-    let args = DaemonCli::parse();
+    let args = ArgsYgg::parse();
     if args.generate.run()? {
         return Ok(());
     }
@@ -32,7 +32,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         yggdrasil,
         peers,
         listen,
-    } = config::load_config(&args.config, !args.no_tun, true)?;
+        remote_control: _,
+    } = match &args.config {
+        Some(path) => config::load_config(path, !args.no_tun, true)?,
+        None => todo!("BUG"),
+    };
 
     let tun = yggdrasil
         .tun

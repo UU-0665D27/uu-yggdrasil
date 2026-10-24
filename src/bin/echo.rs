@@ -14,13 +14,12 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{error::Error, io, sync::Arc};
-
 use clap::Parser as _;
+use std::{error::Error, io, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uu_yggdrasil::{
-    YggTcpListener, YggTcpStream, YggUdpSocket, Yggdrasil, YggdrasilConfig,
-    cli::EchoCli,
+    YggTcpListener, YggTcpStream, YggUdpSocket, Yggdrasil,
+    cli::ArgsYgg,
     config::{self, LoadedConfig},
 };
 
@@ -31,7 +30,7 @@ const UDP_BUFFER: usize = 65_535;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     uu_yggdrasil::init_tracing();
-    let args = EchoCli::parse();
+    let args = ArgsYgg::parse();
     if args.generate.run()? {
         return Ok(());
     }
@@ -40,13 +39,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         yggdrasil,
         peers,
         listen,
+        remote_control: _,
     } = match args.config {
         Some(path) => config::load_config(&path, false, false)?,
-        None => LoadedConfig {
-            yggdrasil: YggdrasilConfig::default(),
-            peers: Vec::new(),
-            listen: Vec::new(),
-        },
+        None => todo!("BUG"),
     };
 
     let node = Arc::new(Yggdrasil::new(yggdrasil).await?);

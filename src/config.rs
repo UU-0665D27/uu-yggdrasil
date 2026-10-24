@@ -3,6 +3,10 @@
 //! Поддерживаются TOML и JSON. TOML — основной формат (как у
 //! yggdrasil-совместимых демонов), JSON оставлен для совместимости.
 
+use crate::{NodeInfoConfig, TunConfig, YggdrasilConfig};
+use ed25519_dalek::SigningKey;
+use serde::Deserialize;
+use serde_json::Value;
 use std::{
     error::Error,
     fmt::Write as _,
@@ -12,17 +16,12 @@ use std::{
     path::Path,
 };
 
-use ed25519_dalek::SigningKey;
-use serde::Deserialize;
-use serde_json::Value;
-
-use crate::{NodeInfoConfig, TunConfig, YggdrasilConfig};
-
 /// Разобранный конфиг: готовый узел плюс пиры и listen-адреса.
 pub struct LoadedConfig {
     pub yggdrasil: YggdrasilConfig,
     pub peers: Vec<String>,
     pub listen: Vec<SocketAddr>,
+    pub remote_control: RemoteControl,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,6 +45,19 @@ struct FileConfig {
     node_info_privacy: Option<bool>,
     #[serde(alias = "IncludePeers")]
     include_peers: Option<bool>,
+
+    #[serde(alias = "RemoteControl")]
+    remote_control: RemoteControl,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RemoteControl {
+    #[serde(alias = "enabled")]
+    pub enabled: bool,
+    /// Порт TCP-консоли внутри yggdrasil; 0 — не запускать консоль.
+    #[serde(alias = "port")]
+    pub port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,11 +112,12 @@ pub fn load_config(
         .iter()
         .map(|uri| parse_listen(uri))
         .collect::<Result<Vec<_>, _>>()?;
-
+    let remote_control = file.remote_control;
     Ok(LoadedConfig {
         yggdrasil,
         peers,
         listen,
+        remote_control,
     })
 }
 

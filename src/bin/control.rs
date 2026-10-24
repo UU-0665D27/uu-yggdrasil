@@ -17,13 +17,12 @@
 #[path = "common/mod.rs"]
 mod common;
 
+use clap::Parser;
 use std::{error::Error, sync::Arc};
-
-use clap::Parser as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use uu_yggdrasil::{
-    YggTcpListener, YggTcpStream, Yggdrasil, YggdrasilConfig,
-    cli::ControlCli,
+    YggTcpListener, YggTcpStream, Yggdrasil,
+    cli::ArgsYgg,
     config::{self, LoadedConfig},
 };
 
@@ -41,7 +40,7 @@ commands:
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     uu_yggdrasil::init_tracing();
-    let args = ControlCli::parse();
+    let args = ArgsYgg::parse();
     if args.generate.run()? {
         return Ok(());
     }
@@ -50,13 +49,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         yggdrasil,
         peers,
         listen,
+        remote_control,
     } = match args.config {
         Some(path) => config::load_config(&path, false, false)?,
-        None => LoadedConfig {
-            yggdrasil: YggdrasilConfig::default(),
-            peers: Vec::new(),
-            listen: Vec::new(),
-        },
+        None => todo!("BUG"),
     };
 
     let node = Arc::new(Yggdrasil::new(yggdrasil).await?);
@@ -76,11 +72,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }));
     }
 
-    let control_task = if args.control_port == 0 {
-        println!("control: disabled");
-        None
-    } else {
-        let listener = node.tcp_listen(args.control_port).await?;
+    let control_task = if remote_control.enabled {
+        let listener = node.tcp_listen(remote_control.port).await?;
         println!(
             "control: [{}]:{} (TCP)",
             node.address(),
@@ -90,6 +83,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arc::clone(&node),
             listener,
         )))
+    } else {
+        println!("control: disabled");
+        None
     };
 
     println!("running; press Ctrl-C to stop");
@@ -237,12 +233,20 @@ fn parse_command(line: &str) -> Command<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::atomic::{AtomicU16, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU16, Ordering},
+        },
     };
-    use tokio::time::{Duration, timeout};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        time::{Duration, timeout},
+    };
+    use uu_yggdrasil::{Yggdrasil, YggdrasilConfig, config};
+
+    use crate::{Command, control_accept_loop, parse_command};
 
     fn control_port() -> u16 {
         static NEXT: AtomicU16 = AtomicU16::new(24_000);
@@ -298,7 +302,6 @@ mod tests {
         line.clear();
         reader.read_line(&mut line).await.unwrap();
         assert_eq!(line.trim(), config::hex(b.public_key().as_bytes()));
-
         task.abort();
         a.close();
         b.close();
