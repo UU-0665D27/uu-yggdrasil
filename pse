@@ -1,9 +1,0 @@
-let yggdrasil=yggdrasil::new
-yggdrasil.peer_uri(uri)
-yggdrasil.peer_tcp(ip,port)
-yggdrasil.peer_udp(ip,port)
-let connection_tcp:TcpStream=yggdrasil.tcp(ip,port)
-let connection_udp:UdpSocket=yggdrasil.tcp(ip,port)
-
-должен быть node_info
-через конфиг можно сделать возврат в node_info пиров к которым подключены 
