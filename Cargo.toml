@@ -9,6 +9,14 @@ pedantic="deny"
 nursery="deny"
 perf="deny"
 
+[[bin]]
+name = "uu-yggdrasil-daemon"
+path = "src/bin/daemon.rs"
+
+[[bin]]
+name = "uu-yggdrasil-echo"
+path = "src/bin/echo.rs"
+
 [dependencies]
 async-trait = "0.1.92"
 blake2 = "0.10.6"
@@ -16,6 +24,7 @@ crypto_box = { version = "0.9.1", features = ["std"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 smoltcp = { version = "0.14.0", default-features = false, features = [

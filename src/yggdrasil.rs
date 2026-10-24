@@ -613,13 +613,7 @@ impl Inner {
         let task = tokio::spawn(async move {
             let _ = spawn_conn(node, key, Box::new(stream), priority).await;
         });
-        let mut tasks = self
-            .tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
-        drop(tasks);
+        self.push_task(task);
         // Дать session-loop зарегистрировать пира до возврата из API.
         for _ in 0..100 {
             if self.node.peer_keys().contains(&key) {
@@ -628,6 +622,15 @@ impl Inner {
             sleep(Duration::from_millis(10)).await;
         }
         Ok(info)
+    }
+
+    fn push_task(&self, task: JoinHandle<()>) {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
 
     fn node_info_json(&self) -> Value {
