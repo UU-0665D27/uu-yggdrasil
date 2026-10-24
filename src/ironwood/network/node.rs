@@ -113,10 +113,12 @@ impl Ironwood {
     /// Периодическое обслуживание. В Go это `_doMaintenance`; у нас пока
     /// только Bloom'ы — `_fix`/`_sendAnnounces` придут со следующим этапом.
     pub fn do_maintenance(&self) {
+        let mut pf = self.pathfinder_lock();
         let mut router = self.router_lock();
         router.do_maintenance();
+        pf.do_maintenance(&mut router, &self.config);
         drop(router);
-        self.pathfinder_lock().do_maintenance(&self.config);
+        drop(pf);
         self.sessions_lock()
             .do_maintenance(std::time::Instant::now());
     }

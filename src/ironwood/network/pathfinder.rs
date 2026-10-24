@@ -670,13 +670,33 @@ impl Pathfinder {
     }
 
     /// Удалить просроченные `paths` и `rumors`.
-    pub fn do_maintenance(&mut self, config: &Config) {
+    pub fn do_maintenance(&mut self, router: &mut Router, config: &Config) {
         let timeout = config.path_timeout;
         let now = Instant::now();
         self.paths
             .retain(|_, info| now.duration_since(info.last_seen) < timeout);
         self.rumors
             .retain(|_, rumor| now.duration_since(rumor.last_seen) < timeout);
+
+        // Трафик мог прийти раньше, чем появились bloom'ы/координаты пиров.
+        // Первый lookup в таком случае уходит в никуда; повторяем его, пока
+        // маршрут не найдётся (не чаще `path_throttle`).
+        let retry: Vec<([u8; 32], PublicKey)> = self
+            .rumors
+            .iter()
+            .filter_map(|(xform, rumor)| {
+                let tr = rumor.traffic.as_ref()?;
+                (now.duration_since(rumor.send_time) >= config.path_throttle)
+                    .then_some((*xform, tr.dest))
+            })
+            .collect();
+        for (xform, dest) in retry {
+            if let Some(rumor) = self.rumors.get_mut(&xform) {
+                rumor.send_time = now;
+                rumor.last_seen = now;
+            }
+            self.send_lookup(router, *dest.as_bytes());
+        }
     }
 }
 

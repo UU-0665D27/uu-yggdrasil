@@ -755,6 +755,7 @@ impl State {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn command(&mut self, command: Command) {
         match command {
             Command::AddTcpListener {
