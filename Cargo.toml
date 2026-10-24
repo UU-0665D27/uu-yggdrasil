@@ -10,17 +10,19 @@ pedantic="deny"
 nursery="deny"
 perf="deny"
 
-[[bin]]
-name = "uu-yggdrasil-daemon"
-path = "src/bin/daemon.rs"
-
-[[bin]]
-name = "uu-yggdrasil-echo"
-path = "src/bin/echo.rs"
+[profile.release]
+# 1. Максимальная оптимизация под размер
+opt-level = "z"
+# 2. Полная Link-Time Optimization (LTO) для удаления мёртвого кода
+lto = "fat"
+# 3. Единственная единица кодогенерации для лучшей сквозной оптимизации
+codegen-units = 1
+# 4. Удаление всей символьной информации (включая отладочную)
+strip = true
 
 [dependencies]
 async-trait = "0.1.92"
-blake2 = "0.10.6"
+blake2 = "0.11.0"
 clap = { version = "4", features = ["derive"] }
 crypto_box = { version = "0.9.1", features = ["std"] }
 curve25519-dalek = "5.0.0"
@@ -39,6 +41,6 @@ smoltcp = { version = "0.14.0", default-features = false, features = [
 ] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io-util"] }
-toml = "0.8"
+toml = "1.1"
 tun = { version = "0.8.14", features = ["async"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }

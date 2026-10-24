@@ -9,7 +9,7 @@
 //! Работает через `Read`/`Write`, поэтому handshake можно гонять
 //! на массиве байт (фаззинг) и на `TcpStream` через `SyncIoBridge`.
 
-use blake2::digest::{Digest, Mac};
+use blake2::digest::{Digest, KeyInit, Mac};
 use blake2::{Blake2b512, Blake2bMac512};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::io::{self, Read, Write};
@@ -63,7 +63,7 @@ fn hash_public_key(password: &[u8], key: &VerifyingKey) -> io::Result<[u8; 64]> 
         hasher.update(key.as_bytes());
         return Ok(hasher.finalize().into());
     }
-    let mut mac = <Blake2bMac512 as Mac>::new_from_slice(password)
+    let mut mac = <Blake2bMac512 as KeyInit>::new_from_slice(password)
         .map_err(|_| invalid("password is too long for blake2b key"))?;
     mac.update(key.as_bytes());
     Ok(mac.finalize().into_bytes().into())

@@ -91,6 +91,26 @@ pub struct EchoCli {
     pub generate: GenConfArgs,
 }
 
+/// Аргументы узла с TCP-консолью управления.
+#[derive(Debug, Parser)]
+#[command(
+    name = "uu-yggdrasil-control",
+    version,
+    about = "uu-yggdrasil node with a TCP control shell over the overlay"
+)]
+pub struct ControlCli {
+    /// TOML/JSON-конфиг (необязательно).
+    #[arg(short = 'c', long = "config", value_name = "FILE")]
+    pub config: Option<std::path::PathBuf>,
+
+    /// Порт TCP-консоли внутри yggdrasil; 0 — не запускать консоль.
+    #[arg(long = "control-port", value_name = "PORT", default_value_t = 4456)]
+    pub control_port: u16,
+
+    #[command(flatten)]
+    pub generate: GenConfArgs,
+}
+
 /// Точка входа главного CLI.
 ///
 /// # Errors
@@ -129,5 +149,11 @@ mod tests {
     fn daemon_config_has_default() {
         let cli = DaemonCli::try_parse_from(["uu-yggdrasil-daemon"]).expect("parse");
         assert_eq!(cli.config, std::path::PathBuf::from("yggdrasil.toml"));
+    }
+
+    #[test]
+    fn control_listens_on_4456_by_default() {
+        let cli = ControlCli::try_parse_from(["uu-yggdrasil-control"]).expect("parse");
+        assert_eq!(cli.control_port, 4456);
     }
 }
