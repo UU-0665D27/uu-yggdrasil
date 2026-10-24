@@ -39,9 +39,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         yggdrasil,
         peers,
         listen,
-        remote_control: _,
     } = match args.config {
-        Some(path) => config::load_config(&path, false, false)?,
+        Some(path) => config::load_config(&path)?,
         None => todo!("BUG"),
     };
 

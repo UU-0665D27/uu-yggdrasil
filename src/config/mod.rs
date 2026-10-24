@@ -3,7 +3,7 @@
 //! Поддерживаются TOML и JSON. TOML — основной формат (как у
 //! yggdrasil-совместимых демонов), JSON оставлен для совместимости.
 
-use crate::{NodeInfoConfig, TunConfig, YggdrasilConfig};
+use crate::{NodeInfoConfig, TunConfig, YggdrasilConfig, config::tun::TunSetting};
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
 use serde_json::Value;
@@ -15,13 +15,13 @@ use std::{
     net::SocketAddr,
     path::Path,
 };
+pub mod tun;
 
 /// Разобранный конфиг: готовый узел плюс пиры и listen-адреса.
 pub struct LoadedConfig {
     pub yggdrasil: YggdrasilConfig,
     pub peers: Vec<String>,
     pub listen: Vec<SocketAddr>,
-    pub remote_control: RemoteControl,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -49,9 +49,6 @@ struct FileConfig {
     node_info_privacy: Option<bool>,
     #[serde(alias = "IncludePeers")]
     include_peers: Option<bool>,
-
-    #[serde(alias = "RemoteControl")]
-    remote_control: RemoteControl,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -62,21 +59,6 @@ pub struct RemoteControl {
     /// Порт TCP-консоли внутри yggdrasil; 0 — не запускать консоль.
     #[serde(alias = "port")]
     pub port: u16,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TunSetting {
-    Enabled(bool),
-    Config(TunFile),
-    Name(String),
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct TunFile {
-    name: Option<String>,
-    mtu: Option<u16>,
 }
 
 /// Загрузить конфиг из TOML или JSON.
@@ -112,12 +94,10 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, Box<dyn Error>> {
         .iter()
         .map(|uri| parse_listen(uri))
         .collect::<Result<Vec<_>, _>>()?;
-    let remote_control = file.remote_control;
     Ok(LoadedConfig {
         yggdrasil,
         peers,
         listen,
-        remote_control,
     })
 }
 
@@ -271,7 +251,7 @@ fn build_tun(file: &FileConfig) -> Option<TunConfig> {
     let fallback = TunConfig::default();
     let configured_name = file.if_name.as_deref();
     let configured_mtu = file.if_mtu.unwrap_or(fallback.mtu);
-    let r = true;
+
     match &file.tun {
         Some(TunSetting::Enabled(false)) => None,
         Some(TunSetting::Enabled(true)) => {
@@ -287,15 +267,7 @@ fn build_tun(file: &FileConfig) -> Option<TunConfig> {
                 .unwrap_or(fallback.name);
             make_tun(&name, config.mtu.unwrap_or(configured_mtu))
         }
-        None => configured_name.map_or_else(
-            || {
-                r.then_some(TunConfig {
-                    name: fallback.name,
-                    mtu: configured_mtu,
-                })
-            },
-            |name| make_tun(name, configured_mtu),
-        ),
+        None => make_tun(&fallback.name, configured_mtu),
     }
 }
 

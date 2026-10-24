@@ -1,8 +1,8 @@
 //! Общие runtime-помощники для bin-целей.
 
 use std::{sync::Arc, time::Duration};
-
 use tokio::time::sleep;
+use tracing::debug;
 use uu_yggdrasil::{Yggdrasil, config::hex, ironwood::network::PublicKey};
 
 const PEER_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -26,7 +26,7 @@ pub async fn maintain_peer(node: Arc<Yggdrasil>, uri: String) {
 
         match node.peer_uri(&uri).await {
             Ok(info) => {
-                println!(
+                debug!(
                     "peer {uri}: connected to {} at {}",
                     hex(info.key.as_bytes()),
                     info.address

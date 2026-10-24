@@ -4,18 +4,16 @@
 //! Секрет фиксирован (seed 0xfe) и имеет «высокий» ключ, чтобы не стать
 //! корнем тестовой сети.
 
-use std::net::Ipv6Addr;
-use std::str::FromStr;
-use std::time::Duration;
-
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use std::{net::Ipv6Addr, str::FromStr, time::Duration};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
-
-use uu_yggdrasil::address::addr_for_key;
-use uu_yggdrasil::ironwood::{
-    Ironwood, KeyAddr, PacketConn, PacketConnBase,
-    network::{Config, handshake_async, spawn_conn},
+use uu_yggdrasil::{
+    address::addr_for_key,
+    ironwood::{
+        Ironwood, KeyAddr, PacketConn, PacketConnBase,
+        network::{Config, handshake_async, spawn_conn},
+    },
 };
 
 const DEFAULT_PEER: &str = "127.0.0.1:7992";

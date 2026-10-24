@@ -20,6 +20,7 @@ mod common;
 use clap::Parser;
 use std::{error::Error, sync::Arc};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tracing::info;
 use uu_yggdrasil::{
     YggTcpListener, YggTcpStream, Yggdrasil,
     cli::ArgsYgg,
@@ -49,19 +50,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         yggdrasil,
         peers,
         listen,
-        remote_control,
     } = match args.config {
-        Some(path) => config::load_config(&path, false, false)?,
+        Some(path) => config::load_config(&path)?,
         None => todo!("BUG"),
     };
 
     let node = Arc::new(Yggdrasil::new(yggdrasil).await?);
-    println!("yggdrasil control node (TUN disabled)");
-    println!("public key: {}", config::hex(node.public_key().as_bytes()));
-    println!("address: {}", node.address());
+    info!("yggdrasil control node (TUN disabled)");
+    info!("public key: {}", config::hex(node.public_key().as_bytes()));
+    info!("address: {}", node.address());
     for address in listen {
         let bound = node.listen_tcp(address).await?;
-        println!("peer listener: tcp://{bound}");
+        info!("peer listener: tcp://{bound}");
     }
 
     let mut peer_tasks = Vec::with_capacity(peers.len());
@@ -72,28 +72,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }));
     }
 
-    let control_task = if remote_control.enabled {
-        let listener = node.tcp_listen(remote_control.port).await?;
-        println!(
+    let control_task = {
+        let listener = node.tcp_listen(4466).await?;
+        info!(
             "control: [{}]:{} (TCP)",
             node.address(),
             listener.local_addr().port()
         );
-        Some(tokio::spawn(control_accept_loop(
-            Arc::clone(&node),
-            listener,
-        )))
-    } else {
-        println!("control: disabled");
-        None
+        tokio::spawn(control_accept_loop(Arc::clone(&node), listener))
     };
 
-    println!("running; press Ctrl-C to stop");
+    info!("running; press Ctrl-C to stop");
     tokio::signal::ctrl_c().await?;
-    println!("shutting down");
-    if let Some(task) = control_task {
-        task.abort();
-    }
+    info!("shutting down");
+    control_task.abort();
     for task in peer_tasks {
         task.abort();
     }
