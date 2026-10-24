@@ -1,4 +1,6 @@
 pub mod address;
+pub mod cli;
+pub mod config;
 pub mod inproc;
 pub mod ironwood;
 pub mod yggdrasil;

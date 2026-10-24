@@ -8,44 +8,40 @@
 //!
 //! ```text
 //! uu-yggdrasil-echo
-//! uu-yggdrasil-echo --config ./yggdrasil.json
+//! uu-yggdrasil-echo --config ./yggdrasil.toml
 //! ```
 
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{env, error::Error, io, path::PathBuf, sync::Arc};
+use std::{error::Error, io, sync::Arc};
 
+use clap::Parser as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uu_yggdrasil::{YggTcpListener, YggTcpStream, YggUdpSocket, Yggdrasil, YggdrasilConfig};
+use uu_yggdrasil::{
+    YggTcpListener, YggTcpStream, YggUdpSocket, Yggdrasil, YggdrasilConfig,
+    cli::EchoCli,
+    config::{self, LoadedConfig},
+};
 
 const ECHO_PORT: u16 = 4455;
 const TCP_BUFFER: usize = 16 * 1024;
 const UDP_BUFFER: usize = 65_535;
 
-const HELP: &str = "\
-Usage: uu-yggdrasil-echo [--config <path>]
-
-  --config <path>  JSON-конфиг (ключ, пиры, listen); TUN игнорируется
-  -h, --help       показать эту справку";
-
-struct Args {
-    config: Option<PathBuf>,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let Some(args) = parse_args()? else {
+    let args = EchoCli::parse();
+    if args.generate.run()? {
         return Ok(());
-    };
+    }
 
-    let common::LoadedConfig {
+    let LoadedConfig {
         yggdrasil,
         peers,
         listen,
     } = match args.config {
-        Some(path) => common::load_config(&path, false, false)?,
-        None => common::LoadedConfig {
+        Some(path) => config::load_config(&path, false, false)?,
+        None => LoadedConfig {
             yggdrasil: YggdrasilConfig::default(),
             peers: Vec::new(),
             listen: Vec::new(),
@@ -54,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let node = Arc::new(Yggdrasil::new(yggdrasil).await?);
     println!("yggdrasil echo node (TUN disabled)");
-    println!("public key: {}", common::hex(node.public_key().as_bytes()));
+    println!("public key: {}", config::hex(node.public_key().as_bytes()));
     println!("address: {}", node.address());
     for address in listen {
         let bound = node.listen_tcp(address).await?;
@@ -137,43 +133,4 @@ async fn udp_echo_loop(mut socket: YggUdpSocket) -> io::Result<()> {
             eprintln!("udp echo to {from}: {error}");
         }
     }
-}
-
-fn parse_args() -> Result<Option<Args>, Box<dyn Error>> {
-    let mut args = env::args().skip(1);
-    let mut config = None;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                println!("{HELP}");
-                return Ok(None);
-            }
-            "-c" | "--config" => {
-                let path = args.next().ok_or("--config requires a path")?;
-                set_config(&mut config, PathBuf::from(path))?;
-            }
-            _ if arg.starts_with("--config=") => {
-                let path = arg.trim_start_matches("--config=");
-                set_config(&mut config, PathBuf::from(path))?;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(format!("unknown option: {arg}").into());
-            }
-            _ => set_config(&mut config, PathBuf::from(arg))?,
-        }
-    }
-
-    Ok(Some(Args { config }))
-}
-
-fn set_config(slot: &mut Option<PathBuf>, path: PathBuf) -> Result<(), Box<dyn Error>> {
-    if slot.is_some() {
-        return Err("config path specified more than once".into());
-    }
-    if path.as_os_str().is_empty() {
-        return Err("config path must not be empty".into());
-    }
-    *slot = Some(path);
-    Ok(())
 }
