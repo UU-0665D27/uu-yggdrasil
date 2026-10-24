@@ -20,6 +20,7 @@
 //! [`YggdrasilConfig::with_tun`].
 //!
 //! ```no_run
+//! use std::net::Ipv6Addr;
 //! use uu_yggdrasil::{YggdrasilConfig, new};
 //!
 //! # async fn run() -> std::io::Result<()> {
@@ -30,7 +31,7 @@
 //! yggdrasil
 //!     .peer_uri("tcp://127.0.0.1:7992?key=<64 hex>&priority=10")
 //!     .await?;
-//! let stream = yggdrasil.tcp("200::1".parse().unwrap(), 80).await?;
+//! let stream = yggdrasil.tcp("200::1".parse::<Ipv6Addr>().unwrap(), 80).await?;
 //! let info = yggdrasil.node_info();
 //! # let _ = (stream, info);
 //! # Ok(())

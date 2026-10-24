@@ -777,6 +777,12 @@ impl SessionManager {
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
+
+    /// Количество буферов начатых handshake'ей (для отладки).
+    #[must_use]
+    pub fn buffer_count(&self) -> usize {
+        self.buffers.len()
+    }
 }
 
 /// `_ = Error` — на будущее (например, `Error::ENCODE` при создании
