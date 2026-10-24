@@ -693,7 +693,6 @@ impl Pathfinder {
         for (xform, dest) in retry {
             if let Some(rumor) = self.rumors.get_mut(&xform) {
                 rumor.send_time = now;
-                rumor.last_seen = now;
             }
             self.send_lookup(router, *dest.as_bytes());
         }
