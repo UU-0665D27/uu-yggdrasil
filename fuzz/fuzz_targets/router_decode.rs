@@ -7,8 +7,8 @@ use uu_yggdrasil::ironwood::network::{
     router::types::{RouterAnnounce, RouterSigReq, RouterSigRes},
 };
 
-/// Каждый decode с последующим re-encode должен давать стабильный roundtrip.
-/// Плюс `check()` не должен паниковать ни на каком входе.
+// Каждый decode с последующим re-encode должен давать стабильный roundtrip.
+// Плюс `check()` не должен паниковать ни на каком входе.
 fuzz_target!(|data: &[u8]| {
     if let Ok(req) = RouterSigReq::decode(data) {
         let mut out = Vec::with_capacity(WireEncodable::size(&req));

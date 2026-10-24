@@ -7,8 +7,8 @@ use uu_yggdrasil::ironwood::network::{
     WireEncodable, WirePacketType,
 };
 
-/// Аналог `FuzzPeerHandlePacket`: диспетчеризация по байту типа — как
-/// в `Peer::handle_packet`. Каждый decode не должен паниковать.
+// Аналог `FuzzPeerHandlePacket`: диспетчеризация по байту типа — как
+// в `Peer::handle_packet`. Каждый decode не должен паниковать.
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
