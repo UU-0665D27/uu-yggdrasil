@@ -46,6 +46,12 @@ use crate::{
 
 /// Синтетический порт QUIC-адресов. Реальной UDP-розетки нет.
 const QUIC_PORT: u16 = 4433;
+/// Тип сессии yggdrasil для пользовательского трафика.
+///
+/// `yggdrasil-go` добавляет этот байт перед каждой QUIC-датаграммой и
+/// отбрасывает датаграммы с другим первым байтом, поэтому для совместимости
+/// его нужно добавлять и здесь.
+const SESSION_TRAFFIC: u8 = 1;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
@@ -335,6 +341,19 @@ impl AsyncWrite for QuicStream {
     }
 }
 
+fn add_traffic_prefix(data: &[u8]) -> Vec<u8> {
+    let mut datagram = Vec::with_capacity(data.len() + 1);
+    datagram.push(SESSION_TRAFFIC);
+    datagram.extend_from_slice(data);
+    datagram
+}
+
+fn strip_traffic_prefix(datagram: &[u8]) -> &[u8] {
+    datagram
+        .strip_prefix(&[SESSION_TRAFFIC])
+        .unwrap_or(datagram)
+}
+
 fn spawn_receive_pump(
     socket: Arc<YggUdpSocket>,
     node: Arc<crate::ironwood::network::Ironwood>,
@@ -355,12 +374,16 @@ fn spawn_receive_pump(
                         .write()
                         .unwrap_or_else(PoisonError::into_inner)
                         .insert(address, key);
+                    let payload = strip_traffic_prefix(&buf[..n]);
+                    if payload.is_empty() {
+                        continue;
+                    }
                     trace!(
                         key = %crate::config::hex(key.as_bytes()),
-                        bytes = n,
+                        bytes = payload.len(),
                         "quic: datagram received"
                     );
-                    socket.push(Vec::from(&buf[..n]), addr);
+                    socket.push(Vec::from(payload), addr);
                 }
             }
         }
@@ -385,7 +408,8 @@ fn spawn_send_pump(
                 bytes = data.len(),
                 "quic: datagram send"
             );
-            if let Err(error) = node.send_to(&data, &KeyAddr(key)).await {
+            let datagram = add_traffic_prefix(&data);
+            if let Err(error) = node.send_to(&datagram, &KeyAddr(key)).await {
                 debug!(
                     peer = %crate::config::hex(key.as_bytes()),
                     %error,
@@ -720,6 +744,20 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         time::Instant,
     };
+
+    #[test]
+    fn traffic_prefix_is_added_and_stripped() {
+        let data = b"\xc0initial-quic-datagram";
+        let datagram = add_traffic_prefix(data);
+        assert_eq!(datagram.first(), Some(&SESSION_TRAFFIC));
+        assert_eq!(strip_traffic_prefix(&datagram), data);
+    }
+
+    #[test]
+    fn unprefixed_datagram_is_accepted() {
+        let data = b"\xc0legacy-datagram";
+        assert_eq!(strip_traffic_prefix(data), data);
+    }
 
     async fn connect_nodes(a: &Yggdrasil, b: &Yggdrasil) {
         let (socket_a, socket_b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
