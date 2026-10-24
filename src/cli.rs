@@ -59,10 +59,6 @@ pub struct ArgsYgg {
     )]
     pub config: Option<PathBuf>,
 
-    /// Не создавать TUN, даже если он включён в конфиге.
-    #[arg(long = "no-tun")]
-    pub no_tun: bool,
-
     #[command(flatten)]
     pub generate: GenConfArgs,
 }

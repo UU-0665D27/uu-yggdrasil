@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         listen,
         remote_control: _,
     } = match &args.config {
-        Some(path) => config::load_config(path, !args.no_tun, true)?,
+        Some(path) => config::load_config(path)?,
         None => todo!("BUG"),
     };
 

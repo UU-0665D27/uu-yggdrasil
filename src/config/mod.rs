@@ -33,12 +33,16 @@ struct FileConfig {
     peers: Vec<String>,
     #[serde(alias = "Listen")]
     listen: Vec<String>,
+
+    #[serde(alias = "tun_enabled")]
+    tun_enabled: bool,
     #[serde(alias = "Tun", alias = "TUN")]
     tun: Option<TunSetting>,
     #[serde(alias = "IfName")]
     if_name: Option<String>,
     #[serde(alias = "IfMTU")]
     if_mtu: Option<u16>,
+
     #[serde(alias = "NodeInfo")]
     node_info: Option<Value>,
     #[serde(alias = "NodeInfoPrivacy")]
@@ -82,11 +86,7 @@ struct TunFile {
 ///
 /// # Errors
 /// Ошибка чтения/разбора файла, ключа или listen-адреса.
-pub fn load_config(
-    path: &Path,
-    allow_tun: bool,
-    default_tun: bool,
-) -> Result<LoadedConfig, Box<dyn Error>> {
+pub fn load_config(path: &Path) -> Result<LoadedConfig, Box<dyn Error>> {
     let text = fs::read_to_string(path)?;
     let file = parse_file_config(&text, path)?;
 
@@ -94,7 +94,7 @@ pub fn load_config(
     if let Some(key) = file.private_key.as_deref() {
         yggdrasil.private_key = parse_private_key(key)?;
     }
-    yggdrasil.tun = build_tun(&file, allow_tun, default_tun);
+    yggdrasil.tun = build_tun(&file);
     yggdrasil.node_info = build_node_info(
         file.node_info.as_ref(),
         file.node_info_privacy,
@@ -264,14 +264,14 @@ fn parse_listen(uri: &str) -> Result<SocketAddr, Box<dyn Error>> {
         .map_err(|error| format!("bad listen address {uri:?}: {error}").into())
 }
 
-fn build_tun(file: &FileConfig, allow_tun: bool, default_tun: bool) -> Option<TunConfig> {
-    if !allow_tun {
+fn build_tun(file: &FileConfig) -> Option<TunConfig> {
+    if !file.tun_enabled {
         return None;
     }
     let fallback = TunConfig::default();
     let configured_name = file.if_name.as_deref();
     let configured_mtu = file.if_mtu.unwrap_or(fallback.mtu);
-
+    let r = true;
     match &file.tun {
         Some(TunSetting::Enabled(false)) => None,
         Some(TunSetting::Enabled(true)) => {
@@ -289,7 +289,7 @@ fn build_tun(file: &FileConfig, allow_tun: bool, default_tun: bool) -> Option<Tu
         }
         None => configured_name.map_or_else(
             || {
-                default_tun.then_some(TunConfig {
+                r.then_some(TunConfig {
                     name: fallback.name,
                     mtu: configured_mtu,
                 })
