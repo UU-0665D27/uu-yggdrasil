@@ -3,9 +3,12 @@ pub mod cli;
 pub mod config;
 pub mod inproc;
 pub mod ironwood;
+pub mod multicast;
 pub mod quic;
+mod ws;
 pub mod yggdrasil;
 
+pub use config::MulticastInterfaceConfig;
 pub use inproc::{YggTcpListener, YggTcpStream, YggUdpSocket};
 pub use quic::{QuicConnection, QuicStream, YggdrasilQuic};
 pub use yggdrasil::{

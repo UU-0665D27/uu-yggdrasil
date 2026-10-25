@@ -5,14 +5,13 @@
 
 use crate::{NodeInfoConfig, TunConfig, YggdrasilConfig, config::tun::TunSetting};
 use ed25519_dalek::SigningKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     error::Error,
     fmt::Write as _,
     fs,
     io::{self, Write as _},
-    net::SocketAddr,
     path::Path,
 };
 pub mod tun;
@@ -21,7 +20,55 @@ pub mod tun;
 pub struct LoadedConfig {
     pub yggdrasil: YggdrasilConfig,
     pub peers: Vec<String>,
-    pub listen: Vec<SocketAddr>,
+    /// Нормализованные URI слушателей: `tcp://...`, `ws://...`.
+    pub listen: Vec<String>,
+}
+
+/// Настройки multicast-обнаружения для одной группы интерфейсов.
+///
+/// Поля совпадают с Yggdrasil/Go: `filter` (историческое имя `regex`)
+/// сопоставляется с именем интерфейса как glob-шаблон. Первое совпадение
+/// выигрывает.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MulticastInterfaceConfig {
+    /// Glob-шаблон имени интерфейса (`*` — все интерфейсы).
+    #[serde(alias = "Regex", alias = "regex")]
+    pub filter: String,
+    /// Отправлять beacon-пакеты.
+    #[serde(alias = "Beacon")]
+    pub beacon: bool,
+    /// Слушать beacon-пакеты и подключаться к найденным узлам.
+    #[serde(alias = "Listen")]
+    pub listen: bool,
+    /// TCP-порт TLS-listener'а (`0` — выбрать свободный).
+    #[serde(alias = "Port")]
+    pub port: u16,
+    /// Приоритет обнаруженных пиров.
+    #[serde(alias = "Priority")]
+    pub priority: u8,
+    /// Пароль для beacon-хэша и handshake.
+    #[serde(alias = "Password")]
+    pub password: String,
+}
+
+impl Default for MulticastInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            filter: "*".to_owned(),
+            beacon: true,
+            listen: true,
+            port: 0,
+            priority: 0,
+            password: String::new(),
+        }
+    }
+}
+
+/// Настройки multicast по умолчанию: включены на всех подходящих интерфейсах.
+#[must_use]
+pub fn default_multicast_interfaces() -> Vec<MulticastInterfaceConfig> {
+    vec![MulticastInterfaceConfig::default()]
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -33,6 +80,8 @@ struct FileConfig {
     peers: Vec<String>,
     #[serde(alias = "Listen")]
     listen: Vec<String>,
+    #[serde(alias = "MulticastInterfaces")]
+    multicast_interfaces: Option<Vec<MulticastInterfaceConfig>>,
 
     #[serde(alias = "tun_enabled")]
     tun_enabled: bool,
@@ -49,6 +98,39 @@ struct FileConfig {
     node_info_privacy: Option<bool>,
     #[serde(alias = "IncludePeers")]
     include_peers: Option<bool>,
+}
+
+/// Структура, из которой сериализуется TOML-конфиг по умолчанию.
+///
+/// Отдельная от [`FileConfig`] потому, что при загрузке нужно отличать
+/// отсутствующие поля от значений по умолчанию, а при генерации нужен
+/// полный набор полей. `Default` задаёт значения, которые попадут в файл.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ConfigFile {
+    pub private_key: String,
+    pub peers: Vec<String>,
+    pub listen: Vec<String>,
+    pub if_name: String,
+    pub if_mtu: u16,
+    pub node_info_privacy: bool,
+    pub multicast_interfaces: Vec<MulticastInterfaceConfig>,
+    pub node_info: serde_json::Map<String, Value>,
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            private_key: String::new(),
+            peers: Vec::new(),
+            listen: vec!["tcp://0.0.0.0:0".to_owned()],
+            if_name: TunConfig::default().name,
+            if_mtu: TunConfig::default().mtu,
+            node_info_privacy: false,
+            multicast_interfaces: default_multicast_interfaces(),
+            node_info: serde_json::Map::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,6 +159,9 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, Box<dyn Error>> {
         yggdrasil.private_key = parse_private_key(key)?;
     }
     yggdrasil.tun = build_tun(&file);
+    yggdrasil.multicast_interfaces = file
+        .multicast_interfaces
+        .unwrap_or_else(default_multicast_interfaces);
     yggdrasil.node_info = build_node_info(
         file.node_info.as_ref(),
         file.node_info_privacy,
@@ -92,7 +177,7 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, Box<dyn Error>> {
     let listen = file
         .listen
         .iter()
-        .map(|uri| parse_listen(uri))
+        .map(|uri| normalize_listen_uri(uri))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LoadedConfig {
         yggdrasil,
@@ -110,33 +195,12 @@ pub fn generate_toml() -> io::Result<String> {
     getrandom::fill(&mut seed).map_err(io::Error::other)?;
     let signing_key = SigningKey::from_bytes(&seed);
     let public_key = signing_key.verifying_key();
-    let private_key = format!("{}{}", hex(&seed), hex(public_key.as_bytes()));
 
-    Ok(format!(
-        r#"# uu-yggdrasil configuration file
-#
-# TOML. Do not share the private key.
-# 64 bytes (128 hex) = ed25519 seed || public key.
-
-private_key = "{private_key}"
-
-# Outbound peers, e.g. "tcp://host:port?key=<hex>&priority=0".
-peers = []
-
-# Inbound peer listeners. Port 0 picks a free port at startup.
-listen = ["tcp://0.0.0.0:0"]
-
-# TUN interface. Use "none" to disable it.
-if_name = "yggdrasil0"
-if_mtu = 65535
-
-# Set to true to omit build/platform fields from node_info.
-# node_info_privacy = false
-
-# Custom node_info fields, e.g. name = "my-node".
-[node_info]
-"#
-    ))
+    let config = ConfigFile {
+        private_key: format!("{}{}", hex(&seed), hex(public_key.as_bytes())),
+        ..ConfigFile::default()
+    };
+    toml::to_string_pretty(&config).map_err(io::Error::other)
 }
 
 /// Напечатать сгенерированный конфиг или записать его в файл.
@@ -236,12 +300,16 @@ fn normalize_peer_uri(uri: &str) -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn parse_listen(uri: &str) -> Result<SocketAddr, Box<dyn Error>> {
+fn normalize_listen_uri(uri: &str) -> Result<String, Box<dyn Error>> {
     let uri = uri.trim();
-    let address = uri.strip_prefix("tcp://").unwrap_or(uri);
-    address
-        .parse()
-        .map_err(|error| format!("bad listen address {uri:?}: {error}").into())
+    if uri.is_empty() {
+        return Err("listen URI must not be empty".into());
+    }
+    if uri.contains("://") {
+        Ok(uri.to_owned())
+    } else {
+        Ok(format!("tcp://{uri}"))
+    }
 }
 
 fn build_tun(file: &FileConfig) -> Option<TunConfig> {
@@ -342,6 +410,79 @@ mod tests {
         assert_eq!(
             hex(key.verifying_key().as_bytes()),
             file.private_key.as_deref().expect("key")[64..]
+        );
+        let multicast = file.multicast_interfaces.expect("multicast section");
+        assert_eq!(multicast.len(), 1);
+        assert_eq!(multicast[0].filter, "*");
+        assert!(multicast[0].beacon);
+        assert!(multicast[0].listen);
+    }
+
+    #[test]
+    fn generated_toml_is_serialized_from_default_struct() {
+        let text = generate_toml().expect("generate");
+        let config: ConfigFile = toml::from_str(&text).expect("parse generated config");
+        let defaults = ConfigFile::default();
+        assert_eq!(config.peers, defaults.peers);
+        assert_eq!(config.listen, defaults.listen);
+        assert_eq!(config.if_name, defaults.if_name);
+        assert_eq!(config.if_mtu, defaults.if_mtu);
+        assert_eq!(
+            config.multicast_interfaces[0].filter,
+            defaults.multicast_interfaces[0].filter
+        );
+        assert_eq!(config.private_key.len(), 128);
+    }
+
+    #[test]
+    fn go_style_multicast_aliases_are_parsed() {
+        let text = r#"
+private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+listen = ["tcp://0.0.0.0:0"]
+
+[[MulticastInterfaces]]
+Regex = "wlan*"
+Beacon = false
+Listen = true
+Port = 1234
+Priority = 7
+Password = "secret"
+"#;
+        let file = parse_file_config(text, Path::new("go.toml")).expect("parse");
+        let multicast = file.multicast_interfaces.expect("multicast section");
+        assert_eq!(multicast.len(), 1);
+        assert_eq!(multicast[0].filter, "wlan*");
+        assert!(!multicast[0].beacon);
+        assert!(multicast[0].listen);
+        assert_eq!(multicast[0].port, 1234);
+        assert_eq!(multicast[0].priority, 7);
+        assert_eq!(multicast[0].password, "secret");
+    }
+
+    #[test]
+    fn missing_multicast_section_uses_defaults() {
+        let text = r#"
+private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+listen = ["tcp://0.0.0.0:0"]
+"#;
+        let file = parse_file_config(text, Path::new("old.toml")).expect("parse");
+        assert!(file.multicast_interfaces.is_none());
+        let defaults = default_multicast_interfaces();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].filter, "*");
+    }
+
+    #[test]
+    fn empty_multicast_section_disables_discovery() {
+        let text = r#"
+private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+multicast_interfaces = []
+"#;
+        let file = parse_file_config(text, Path::new("disabled.toml")).expect("parse");
+        assert!(
+            file.multicast_interfaces
+                .expect("multicast section")
+                .is_empty()
         );
     }
 

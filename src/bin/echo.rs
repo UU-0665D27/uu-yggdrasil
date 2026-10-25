@@ -48,9 +48,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("yggdrasil echo node (TUN disabled)");
     println!("public key: {}", config::hex(node.public_key().as_bytes()));
     println!("address: {}", node.address());
-    for address in listen {
-        let bound = node.listen_tcp(address).await?;
-        println!("peer listener: tcp://{bound}");
+    for uri in listen {
+        let bound = node.listen_uri(&uri).await?;
+        println!("peer listener: {uri} -> {bound}");
     }
 
     let mut peer_tasks = Vec::with_capacity(peers.len());

@@ -125,8 +125,9 @@ QUIC-адреса синтетические: IPv6-адрес выводится
 - [x] Rootless-сценарии в `misc/`:
       `run-twolink-test` и `run-schannel-netns`.
 - [x] Проверить сценарии через `unshare -Urnm`, без sudo.
-- [x] Зафиксировать ограничение: multicast-обнаружение не поддерживается,
-      пиры задаются явно через `tcp://...`.
+- [x] Multicast-обнаружение пиров, совместимое с yggdrasil-go и
+      Yggdrasil-ng: `ff02::114:9001`, версия `0.5`, TLS + `meta`-handshake.
+      Включается секцией `[[multicast_interfaces]]`, пустой список выключает.
 
 ---
 

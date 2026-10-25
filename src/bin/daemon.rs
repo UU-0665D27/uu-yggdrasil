@@ -51,9 +51,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         println!("tun: disabled");
     }
-    for address in listen {
-        let bound = node.listen_tcp(address).await?;
-        println!("peer listener: tcp://{bound}");
+    for uri in listen {
+        let bound = node.listen_uri(&uri).await?;
+        println!("peer listener: {uri} -> {bound}");
     }
 
     let mut peer_tasks = Vec::with_capacity(peers.len());

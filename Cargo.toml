@@ -27,16 +27,23 @@ clap = { version = "4", features = ["derive"] }
 crypto_box = { version = "0.9.1", features = ["std"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"
+getifaddrs = "0.6"
 getrandom = "0.4.3"
+glob-match = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 quinn = { git = "https://github.com/iadev09/quinn", branch = "rustls-0.24-upgrade", default-features = false, features = ["runtime-tokio", "rustls-ring", "tracing-log"] }
 # rustls PR #2617 (`InvalidSniPolicy`) is merged into rustls main, which the
 # quinn PR above already tracks. This direct dependency is for the ring
 # `CryptoProvider`, which rustls 0.24 moved out of the `rustls` crate.
 rustls-ring = { git = "https://github.com/rustls/rustls", branch = "main", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
+# TLS for Go-compatible multicast links. This is deliberately a separate
+# stable rustls version from the git build used by quinn above.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+socket2 = "0.6"
 smoltcp = { version = "0.14.0", default-features = false, features = [
     "std",
     "alloc",
@@ -46,6 +53,8 @@ smoltcp = { version = "0.14.0", default-features = false, features = [
     "socket-udp",
 ] }
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-util = { version = "0.7.20", features = ["io-util"] }
 toml = "1.1"
 tracing = "0.1.44"

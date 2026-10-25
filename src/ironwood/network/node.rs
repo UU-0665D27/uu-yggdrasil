@@ -21,7 +21,7 @@ use crate::ironwood::{
     errors::Error,
     network::{
         config::Config,
-        crypto::{Crypto, PublicKey},
+        crypto::{Crypto, PublicKey, is_public_key_valid},
         deadline::Deadline,
         peer::{InFrame, PacketDispatcher, Peer, PeerHandle, session_loop_sync, spawn_peer},
         peers::Peers,
@@ -57,6 +57,9 @@ impl Ironwood {
     /// # Errors
     /// Возможные ошибки инициализации `Config`/`Crypto` (пока их нет — infallible).
     pub fn new(secret: &SigningKey, config: Config) -> Result<Arc<Self>, Error> {
+        if !is_public_key_valid(secret.verifying_key().as_bytes()) {
+            return Err(Error::BAD_KEY);
+        }
         let crypto = Arc::new(Crypto::from_signing_key(secret.clone()));
         let mut router = Router::new(Arc::clone(&crypto), config.clone());
         // Сразу self-root'имся: без этого `lookup` не найдёт маршрута ни к кому.
@@ -286,6 +289,14 @@ impl Ironwood {
     #[must_use]
     pub fn info_count(&self) -> usize {
         self.router_lock().infos.len()
+    }
+
+    /// Ключи всех известных узлов дерева (диагностика).
+    #[must_use]
+    pub fn tree_keys(&self) -> Vec<PublicKey> {
+        let mut keys: Vec<PublicKey> = self.router_lock().infos.keys().copied().collect();
+        keys.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        keys
     }
 
     /// Знает ли pathfinder маршрут до `key`.
@@ -554,7 +565,7 @@ impl PacketConnTrait for Ironwood {
         if self.closed.load(Ordering::SeqCst) {
             return Err(Error::CLOSED);
         }
-        if self.crypto.public_key() == key {
+        if !is_public_key_valid(key.as_bytes()) || self.crypto.public_key() == key {
             return Err(Error::BAD_KEY);
         }
 
@@ -648,7 +659,7 @@ pub async fn spawn_conn(
     if node.closed.load(Ordering::SeqCst) {
         return Err(Error::CLOSED);
     }
-    if node.crypto.public_key() == &key {
+    if !is_public_key_valid(key.as_bytes()) || node.crypto.public_key() == &key {
         return Err(Error::BAD_KEY);
     }
 

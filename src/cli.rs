@@ -42,12 +42,26 @@ impl GenConfArgs {
     }
 }
 
+/// Версия upstream-реализации, с которой сверяется протокол.
+pub const UPSTREAM_YGGDRASIL_GO_VERSION: &str = "0.5.15";
+/// Коммит `yggdrasil-go`, на который ориентирован этот код.
+pub const UPSTREAM_YGGDRASIL_GO_COMMIT: &str = "2c7f050";
+/// Коммит `ironwood`, на который ориентирован этот код.
+pub const UPSTREAM_IRONWOOD_COMMIT: &str = "0712ecc";
+
+const COMPATIBILITY_HELP: &str = "\
+Upstream compatibility:
+  yggdrasil-go 0.5.15 (2c7f050)
+  ironwood 0712ecc
+  wire protocol 0.5";
+
 /// Главный CLI.
 #[derive(Debug, Parser)]
 #[command(
     name = "uu-yggdrasil",
     version,
-    long_about = None
+    long_about = None,
+    after_help = COMPATIBILITY_HELP
 )]
 pub struct ArgsYgg {
     /// TOML/JSON-конфиг.

@@ -5,6 +5,7 @@
 //! - `e2c` — конверсия Ed25519 → X25519.
 //! - `groupAuth` — preimage для подписи handshake'а.
 
+use crate::ironwood::network::crypto::is_public_key_valid;
 use crypto_box::{Nonce, PublicKey, SalsaBox, SecretKey, aead::Aead};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -61,6 +62,9 @@ pub fn ed_sign(msg: &[u8], priv_key: &EdPriv, preimage: Option<&[u8]>) -> EdSig 
 /// `func edCheck(msg, sig, pub, preimage)`.
 #[must_use]
 pub fn ed_check(msg: &[u8], sig: &EdSig, pub_key: &EdPub, preimage: Option<&[u8]>) -> bool {
+    if !is_public_key_valid(pub_key.as_bytes()) {
+        return false;
+    }
     let res = match preimage {
         Some(pre) if !pre.is_empty() => {
             let mut buf = Vec::with_capacity(pre.len() + msg.len());

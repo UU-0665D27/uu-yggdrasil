@@ -13,6 +13,8 @@ use blake2::digest::{Digest, KeyInit, Mac};
 use blake2::{Blake2b512, Blake2bMac512};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::io::{self, Read, Write};
+
+use super::crypto::public_key_from_bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// `ProtocolVersionMajor` из yggdrasil-go.
@@ -165,8 +167,10 @@ pub fn decode_meta(data: &[u8], password: &[u8]) -> io::Result<LinkMeta> {
                 }
                 let mut kb = [0u8; 32];
                 kb.copy_from_slice(value);
-                public_key =
-                    Some(VerifyingKey::from_bytes(&kb).map_err(|_| invalid("bad public key"))?);
+                public_key = Some(
+                    public_key_from_bytes(&kb)
+                        .ok_or_else(|| invalid("invalid or weak public key"))?,
+                );
             }
             META_PRIORITY => {
                 if flen != 1 {

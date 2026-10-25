@@ -1,4 +1,5 @@
 use crate::ironwood::types::addr::KeyAddr;
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 /// `ed25519.PublicKeySize` — 32.
@@ -16,6 +17,29 @@ pub type PrivateKey = SigningKey;
 
 /// `type signature [64]byte`.
 pub type Signature = ed25519_dalek::Signature;
+
+/// Проверка публичного ключа, совместимая с `types.IsPublicKeyValid`
+/// из ironwood: ключ должен канонически раскладываться в точку Ed25519 и
+/// не быть точкой малого порядка (включая identity).
+#[must_use]
+pub fn is_public_key_valid(bytes: &[u8; PUBLIC_KEY_SIZE]) -> bool {
+    let Some(point) = CompressedEdwardsY(*bytes).decompress() else {
+        return false;
+    };
+    if point.compress().to_bytes() != *bytes {
+        return false;
+    }
+    !point.is_small_order()
+}
+
+/// Разобрать публичный ключ с проверкой [`is_public_key_valid`].
+#[must_use]
+pub fn public_key_from_bytes(bytes: &[u8; PUBLIC_KEY_SIZE]) -> Option<PublicKey> {
+    if !is_public_key_valid(bytes) {
+        return None;
+    }
+    VerifyingKey::from_bytes(bytes).ok()
+}
 
 /// `type crypto struct { privateKey; publicKey }`.
 pub struct Crypto {
@@ -144,6 +168,42 @@ mod tests {
         let sig = c.sign(b"msg");
         assert!(public_key_verify(&a, b"msg", &sig));
         assert!(!public_key_verify(&a, b"other", &sig));
+    }
+
+    #[test]
+    fn rejects_invalid_public_keys() {
+        // Векторы из ironwood/types/crypto_test.go.
+        let invalid = [
+            "0200000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000080",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+        ];
+        for encoded in invalid {
+            let bytes = hex_bytes(encoded);
+            assert!(
+                !is_public_key_valid(&bytes),
+                "key {encoded} must be rejected"
+            );
+            assert!(public_key_from_bytes(&bytes).is_none());
+        }
+
+        let valid = Crypto::new(&[7u8; 32]);
+        assert!(is_public_key_valid(valid.public_key().as_bytes()));
+        assert_eq!(
+            public_key_from_bytes(valid.public_key().as_bytes()).as_ref(),
+            Some(valid.public_key())
+        );
+    }
+
+    fn hex_bytes(encoded: &str) -> [u8; PUBLIC_KEY_SIZE] {
+        let mut bytes = [0u8; PUBLIC_KEY_SIZE];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).expect("hex");
+        }
+        bytes
     }
 
     #[test]

@@ -14,7 +14,9 @@ pub mod wire;
 
 pub use bloomfilter::{Bloom, BloomInfo, Blooms};
 pub use config::Config;
-pub use crypto::{Crypto, PrivateKey, PublicKey, Signature};
+pub use crypto::{
+    Crypto, PrivateKey, PublicKey, Signature, is_public_key_valid, public_key_from_bytes,
+};
 pub use deadline::Deadline;
 pub use link::{
     LinkMeta, handshake_async, read_meta, read_meta_async, write_meta, write_meta_async,
