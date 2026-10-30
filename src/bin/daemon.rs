@@ -8,9 +8,6 @@
 //! uu-yggdrasil-daemon --config ./yggdrasil.toml --no-tun
 //! ```
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::{error::Error, sync::Arc};
 
 use clap::Parser as _;
@@ -18,6 +15,7 @@ use uu_yggdrasil::{
     Yggdrasil,
     cli::ArgsYgg,
     config::{self, LoadedConfig},
+    uu::maintain_peer,
 };
 
 #[tokio::main]
@@ -60,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for uri in peers {
         let node = Arc::clone(&node);
         peer_tasks.push(tokio::spawn(async move {
-            common::maintain_peer(node, uri).await;
+            maintain_peer(node, uri).await;
         }));
     }
 

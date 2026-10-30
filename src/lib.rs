@@ -5,6 +5,7 @@ pub mod inproc;
 pub mod ironwood;
 pub mod multicast;
 pub mod quic;
+pub mod uu;
 mod ws;
 pub mod yggdrasil;
 

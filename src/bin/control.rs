@@ -14,9 +14,6 @@
 //! Внимание: у консоли нет аутентификации. Не выставляйте её в недоверенной
 //! сети: любой узел, который может до неё достучаться, сможет добавлять пиров.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use clap::Parser;
 use std::{error::Error, sync::Arc};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -25,6 +22,7 @@ use uu_yggdrasil::{
     YggTcpListener, YggTcpStream, Yggdrasil,
     cli::ArgsYgg,
     config::{self, LoadedConfig},
+    uu::maintain_peer,
 };
 
 const MAX_COMMAND_LEN: usize = 4096;
@@ -68,7 +66,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for uri in peers {
         let node = Arc::clone(&node);
         peer_tasks.push(tokio::spawn(async move {
-            common::maintain_peer(node, uri).await;
+            maintain_peer(node, uri).await;
         }));
     }
 

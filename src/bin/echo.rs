@@ -11,9 +11,6 @@
 //! uu-yggdrasil-echo --config ./yggdrasil.toml
 //! ```
 
-#[path = "common/mod.rs"]
-mod common;
-
 use clap::Parser as _;
 use std::{error::Error, io, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +18,7 @@ use uu_yggdrasil::{
     YggTcpListener, YggTcpStream, YggUdpSocket, Yggdrasil,
     cli::ArgsYgg,
     config::{self, LoadedConfig},
+    uu::maintain_peer,
 };
 
 const ECHO_PORT: u16 = 4455;
@@ -57,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for uri in peers {
         let node = Arc::clone(&node);
         peer_tasks.push(tokio::spawn(async move {
-            common::maintain_peer(node, uri).await;
+            maintain_peer(node, uri).await;
         }));
     }
 

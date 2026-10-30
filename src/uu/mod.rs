@@ -1,9 +1,9 @@
 //! Общие runtime-помощники для bin-целей.
 
+use crate::{Yggdrasil, config::hex, ironwood::network::PublicKey};
 use std::{sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tracing::debug;
-use uu_yggdrasil::{Yggdrasil, config::hex, ironwood::network::PublicKey};
 
 const PEER_RETRY_DELAY: Duration = Duration::from_secs(5);
 const PEER_CHECK_DELAY: Duration = Duration::from_secs(1);
