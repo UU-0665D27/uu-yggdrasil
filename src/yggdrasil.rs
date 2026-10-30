@@ -51,6 +51,7 @@ use crate::ironwood::{
 use crate::ws;
 use ed25519_dalek::SigningKey;
 use serde_json::{Map, Value, json};
+use std::net::SocketAddrV6;
 use std::{
     collections::HashMap,
     fmt::Write as _,
@@ -648,6 +649,33 @@ impl Yggdrasil {
             ));
         }
         self.inner.start_inproc()?.tcp_listen(port).await
+    }
+
+    /// Подключиться по TCP через пользовательский стек по адресу `[IPv6]:port`.
+    ///
+    /// Удобная обёртка над [`Self::tcp_connect`], принимающая адрес и порт
+    /// одним объектом [`SocketAddrV6`] (или любым типом, конвертируемым в него).
+    ///
+    /// # Errors
+    ///
+    /// Возвращает ошибку, если:
+    /// - адрес не является IPv6 (`yggdrasil` работает только поверх IPv6);
+    /// - порт равен `0`;
+    /// - не удалось найти ключ для адресата ([`Self::inner::ensure_key`]);
+    /// - инициализация in-process стека (`start_inproc`) завершилась ошибкой;
+    /// - установка TCP-соединения превысила таймаут или была разорвана.
+    ///
+    /// # See also
+    ///
+    /// - [`Self::tcp_connect`] — если адрес и порт передаются раздельно.
+    pub async fn tcp_connect_addr<I: Into<SocketAddrV6>>(
+        &self,
+        addr: I,
+    ) -> io::Result<YggTcpStream> {
+        let addr = addr.into();
+        let ip = *addr.ip(); // &Ipv6Addr -> Ipv6Addr  (нужен deref!)
+        let port = addr.port(); // u16
+        self.tcp_connect(ip, port).await
     }
 
     /// Подключиться по TCP через пользовательский стек, без TUN.
